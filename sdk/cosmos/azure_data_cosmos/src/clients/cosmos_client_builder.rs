@@ -31,6 +31,7 @@ use azure_core::http::{ClientOptions, LoggingOptions, RetryOptions};
 /// Using Entra ID authentication:
 ///
 /// ```rust,no_run
+/// # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
 /// use azure_data_cosmos::{CosmosClientBuilder, CosmosAccountReference};
 /// use std::sync::Arc;
 ///
@@ -42,12 +43,15 @@ use azure_core::http::{ClientOptions, LoggingOptions, RetryOptions};
 /// ).unwrap();
 /// let client = CosmosClientBuilder::new()
 ///     .build(account)
-///     .unwrap();
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// Using key authentication (requires `key_auth` feature):
 ///
 /// ```rust,no_run,ignore
+/// # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
 /// use azure_data_cosmos::{CosmosClientBuilder, CosmosAccountReference};
 /// use azure_core::credentials::Secret;
 ///
@@ -57,7 +61,9 @@ use azure_core::http::{ClientOptions, LoggingOptions, RetryOptions};
 /// ).unwrap();
 /// let client = CosmosClientBuilder::new()
 ///     .build(account)
-///     .unwrap();
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Default)]
 pub struct CosmosClientBuilder {
@@ -179,7 +185,7 @@ impl CosmosClientBuilder {
     /// # Errors
     ///
     /// Returns an error if the client cannot be constructed.
-    pub fn build(
+    pub async fn build(
         self,
         account: impl Into<CosmosAccountReference>,
     ) -> azure_core::Result<CosmosClient> {
@@ -274,6 +280,8 @@ impl CosmosClientBuilder {
             self.options,
             fault_injection_enabled,
         ));
+
+        // TODO: Populate LocationCache, PartitionKeyRangeCache, ContainerCache during initialization.
 
         Ok(CosmosClient {
             databases_link: ResourceLink::root(ResourceType::Databases),

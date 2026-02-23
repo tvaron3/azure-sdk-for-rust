@@ -38,7 +38,7 @@ pub extern "C" fn cosmos_client_create_with_key(
     options: *const ClientOptions,
     out_client: *mut *mut CosmosClient,
 ) -> CosmosErrorCode {
-    context!(ctx).run_sync_with_output(out_client, || {
+    context!(ctx).run_async_with_output(out_client, async {
         let endpoint = parse_cstr(endpoint, error::messages::INVALID_ENDPOINT)?;
         let key = parse_cstr(key, error::messages::INVALID_KEY)?.to_string();
 
@@ -53,7 +53,7 @@ pub extern "C" fn cosmos_client_create_with_key(
             }
         }
 
-        let client = builder.build(account)?;
+        let client = builder.build(account).await?;
 
         Ok(Box::new(client))
     })
@@ -81,7 +81,7 @@ pub extern "C" fn cosmos_client_create_with_connection_string(
     options: *const ClientOptions,
     out_client: *mut *mut CosmosClient,
 ) -> CosmosErrorCode {
-    context!(ctx).run_sync_with_output(out_client, || {
+    context!(ctx).run_async_with_output(out_client, async {
         let connection_string_str = parse_cstr(
             connection_string,
             error::messages::INVALID_CONNECTION_STRING,
@@ -100,7 +100,7 @@ pub extern "C" fn cosmos_client_create_with_connection_string(
             }
         }
 
-        let client = builder.build(account)?;
+        let client = builder.build(account).await?;
 
         Ok(Box::new(client))
     })

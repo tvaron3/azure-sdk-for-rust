@@ -71,6 +71,7 @@ typedef struct cosmos_container_client cosmos_container_client;
  * Using Entra ID authentication:
  *
  * ```rust,no_run
+ * # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
  * use azure_data_cosmos::{CosmosClient, CosmosAccountReference};
  * use std::sync::Arc;
  *
@@ -82,12 +83,15 @@ typedef struct cosmos_container_client cosmos_container_client;
  * ).unwrap();
  * let client = CosmosClient::builder()
  *     .build(account)
- *     .unwrap();
+ *     .await?;
+ * # Ok(())
+ * # }
  * ```
  *
  * Using key authentication (requires `key_auth` feature):
  *
  * ```rust,no_run,ignore
+ * # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
  * use azure_data_cosmos::{CosmosClient, CosmosAccountReference};
  * use azure_core::credentials::Secret;
  *
@@ -97,7 +101,9 @@ typedef struct cosmos_container_client cosmos_container_client;
  * ).unwrap();
  * let client = CosmosClient::builder()
  *     .build(account)
- *     .unwrap();
+ *     .await?;
+ * # Ok(())
+ * # }
  * ```
  */
 typedef struct cosmos_client cosmos_client;

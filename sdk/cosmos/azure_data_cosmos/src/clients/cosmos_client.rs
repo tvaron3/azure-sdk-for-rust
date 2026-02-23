@@ -27,6 +27,7 @@ use crate::routing::global_partition_endpoint_manager::GlobalPartitionEndpointMa
 /// Using Entra ID authentication:
 ///
 /// ```rust,no_run
+/// # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
 /// use azure_data_cosmos::{CosmosClient, CosmosAccountReference};
 /// use std::sync::Arc;
 ///
@@ -38,12 +39,15 @@ use crate::routing::global_partition_endpoint_manager::GlobalPartitionEndpointMa
 /// ).unwrap();
 /// let client = CosmosClient::builder()
 ///     .build(account)
-///     .unwrap();
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// Using key authentication (requires `key_auth` feature):
 ///
 /// ```rust,no_run,ignore
+/// # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
 /// use azure_data_cosmos::{CosmosClient, CosmosAccountReference};
 /// use azure_core::credentials::Secret;
 ///
@@ -53,7 +57,9 @@ use crate::routing::global_partition_endpoint_manager::GlobalPartitionEndpointMa
 /// ).unwrap();
 /// let client = CosmosClient::builder()
 ///     .build(account)
-///     .unwrap();
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct CosmosClient {
@@ -69,6 +75,7 @@ impl CosmosClient {
     /// # Examples
     ///
     /// ```rust,no_run
+    /// # async fn doc() -> Result<(), Box<dyn std::error::Error>> {
     /// use azure_data_cosmos::{CosmosClient, CosmosAccountReference};
     ///
     /// let credential: std::sync::Arc<dyn azure_core::credentials::TokenCredential> =
@@ -79,7 +86,9 @@ impl CosmosClient {
     /// ).unwrap();
     /// let client = CosmosClient::builder()
     ///     .build(account)
-    ///     .unwrap();
+    ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn builder() -> CosmosClientBuilder {
         CosmosClientBuilder::new()

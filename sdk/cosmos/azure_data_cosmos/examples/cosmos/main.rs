@@ -65,7 +65,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
-    let client = create_client(&args.shared_args)?;
+    let client = create_client(&args.shared_args).await?;
 
     match cmd {
         Subcommands::Create(cmd) => cmd.run(client).await,
@@ -79,7 +79,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn create_client(args: &SharedArgs) -> Result<CosmosClient, Box<dyn Error>> {
+async fn create_client(args: &SharedArgs) -> Result<CosmosClient, Box<dyn Error>> {
     if let Some(key) = args.key.as_ref() {
         #[cfg(feature = "key_auth")]
         {
@@ -87,7 +87,7 @@ fn create_client(args: &SharedArgs) -> Result<CosmosClient, Box<dyn Error>> {
                 &args.endpoint,
                 azure_core::credentials::Secret::from(key.clone()),
             )?;
-            Ok(CosmosClient::builder().build(account)?)
+            Ok(CosmosClient::builder().build(account).await?)
         }
         #[cfg(not(feature = "key_auth"))]
         {
@@ -98,6 +98,6 @@ fn create_client(args: &SharedArgs) -> Result<CosmosClient, Box<dyn Error>> {
         let cred: Arc<dyn azure_core::credentials::TokenCredential> =
             DeveloperToolsCredential::new(None).unwrap();
         let account = CosmosAccountReference::with_credential(&args.endpoint, cred)?;
-        Ok(CosmosClient::builder().build(account)?)
+        Ok(CosmosClient::builder().build(account).await?)
     }
 }

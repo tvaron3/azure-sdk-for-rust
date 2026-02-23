@@ -297,11 +297,12 @@ impl TestClient {
             builder = builder.with_application_preferred_regions(fault_client_preferred_regions);
         }
 
-        let cosmos_client =
-            builder.build(azure_data_cosmos::CosmosAccountReference::with_master_key(
+        let cosmos_client = builder
+            .build(azure_data_cosmos::CosmosAccountReference::with_master_key(
                 &connection_string.account_endpoint,
                 credential,
-            )?)?;
+            )?)
+            .await?;
 
         Ok(TestClient {
             cosmos_client: Some(cosmos_client),
@@ -722,8 +723,8 @@ impl TestRunContext {
             .into_model()?;
 
         // Create two clients with different preferred regions to ensure container is available in both
-        let hub_client = Self::create_client_with_preferred_region(HUB_REGION)?;
-        let satellite_client = Self::create_client_with_preferred_region(SATELLITE_REGION)?;
+        let hub_client = Self::create_client_with_preferred_region(HUB_REGION).await?;
+        let satellite_client = Self::create_client_with_preferred_region(SATELLITE_REGION).await?;
 
         let container_id = &created_properties.id;
 
@@ -771,7 +772,7 @@ impl TestRunContext {
     }
 
     /// Creates a CosmosClient with a specific preferred region.
-    fn create_client_with_preferred_region(
+    async fn create_client_with_preferred_region(
         region: RegionName,
     ) -> Result<CosmosClient, azure_core::Error> {
         let env_var = std::env::var(CONNECTION_STRING_ENV_VAR)
@@ -796,6 +797,7 @@ impl TestRunContext {
                 &parsed.account_endpoint,
                 parsed.account_key.clone(),
             )?)
+            .await
     }
 
     /// Cleans up test resources.
