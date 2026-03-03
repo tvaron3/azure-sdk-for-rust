@@ -227,7 +227,7 @@ pub(crate) const DEFAULT_CONNECTION_TIMEOUT: std::time::Duration =
 /// remain just above typical 60s service timeouts.
 /// See `next_generation_sdks_design_principles.md` for detailed rationale.
 #[cfg(feature = "reqwest")]
-pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Default maximum idle connections per host (1000).
 ///
