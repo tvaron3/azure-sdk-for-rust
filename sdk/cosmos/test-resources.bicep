@@ -21,6 +21,9 @@ param apiVersion string = '2023-04-15'
 @description('The principal to assign the role to. This is application object id.')
 param testApplicationOid string
 
+@description('Authentication mode for integration tests: key or aad')
+param authMode string = 'key'
+
 var databaseName = 'shared-test-db${uniqueString(resourceGroup().id)}'
 var accountName = toLower(baseName)
 var resourceId = cosmosAccount.id
@@ -120,3 +123,4 @@ output RUST_TEST_THREADS string = '1'
 output DATABASE_NAME string = databaseName
 output AZURE_COSMOS_CONNECTION_STRING string = 'AccountEndpoint=${reference(resourceId, apiVersion).documentEndpoint};AccountKey=${listKeys(resourceId, apiVersion).primaryMasterKey};'
 output ACCOUNT_HOST string = reference(resourceId, apiVersion).documentEndpoint
+output AZURE_COSMOS_AUTH_MODE string = authMode

@@ -23,7 +23,13 @@ use tracing_subscriber::EnvFilter;
 
 /// Represents a Cosmos DB client connected to a test account.
 pub struct TestClient {
+    /// The primary client used by tests. In AAD mode, this is an AAD-authenticated client.
+    /// In key mode (default), this is a key-authenticated client.
     cosmos_client: Option<CosmosClient>,
+    /// A key-authenticated client used for control plane operations (create/delete databases
+    /// and containers). Always uses key auth because RBAC roles typically don't grant
+    /// control plane permissions. In key-only mode, this is the same as cosmos_client.
+    setup_client: Option<CosmosClient>,
 }
 
 #[derive(Default)]
@@ -32,6 +38,7 @@ pub struct TestClientOptions {
 }
 
 pub const CONNECTION_STRING_ENV_VAR: &str = "AZURE_COSMOS_CONNECTION_STRING";
+pub const AUTH_MODE_ENV_VAR: &str = "AZURE_COSMOS_AUTH_MODE";
 pub const ACCOUNT_HOST_ENV_VAR: &str = "ACCOUNT_HOST";
 pub const ALLOW_INVALID_CERTS_ENV_VAR: &str = "AZURE_COSMOS_ALLOW_INVALID_CERT";
 pub const TEST_MODE_ENV_VAR: &str = "AZURE_COSMOS_TEST_MODE";
@@ -213,14 +220,19 @@ impl TestClient {
         fault_builder: Option<FaultInjectionClientBuilder>,
         fault_client_application_region: Option<RegionName>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let auth_mode = std::env::var(AUTH_MODE_ENV_VAR).unwrap_or_else(|_| "key".to_string());
+        let is_aad = auth_mode.eq_ignore_ascii_case("aad");
+
         let Ok(env_var) = std::env::var(CONNECTION_STRING_ENV_VAR) else {
             // No connection string provided, so we'll skip tests that require it.
             return Ok(Self {
                 cosmos_client: None,
+                setup_client: None,
             });
         };
 
-        match env_var.as_ref() {
+        // Always build the key-auth client for setup/teardown operations.
+        let key_client = match env_var.as_ref() {
             "emulator" => {
                 if fault_client_application_region.is_some() {
                     eprintln!(
@@ -231,24 +243,91 @@ impl TestClient {
                 // Ignore that the test mode says playback, if the user explicitly asked for emulator, we use it.
                 Self::from_connection_string(
                     EMULATOR_CONNECTION_STRING,
-                    application_region,
+                    application_region.clone(),
                     true,
                     fault_builder,
                     None,
                 )
-                .await
+                .await?
             }
             _ => {
                 Self::from_connection_string(
                     &env_var,
-                    application_region,
+                    application_region.clone(),
                     false,
                     fault_builder,
                     fault_client_application_region,
                 )
-                .await
+                .await?
             }
+        };
+
+        if is_aad && env_var != "emulator" {
+            // In AAD mode, create an AAD-authenticated client for data-plane test operations.
+            // The key client is retained for control plane setup/teardown.
+            let aad_client = Self::create_aad_client(application_region).await?;
+            Ok(Self {
+                cosmos_client: aad_client.cosmos_client,
+                setup_client: key_client.cosmos_client,
+            })
+        } else {
+            // In key mode (or emulator), use the same client for everything.
+            let setup = key_client.cosmos_client.clone();
+            Ok(Self {
+                cosmos_client: key_client.cosmos_client,
+                setup_client: setup,
+            })
         }
+    }
+
+    /// Creates an AAD-authenticated [`CosmosClient`] using environment-appropriate credentials.
+    ///
+    /// In Azure Pipelines, this uses [`AzurePipelinesCredential`]; otherwise, it uses
+    /// [`DeveloperToolsCredential`] (which picks up Azure CLI auth).
+    /// The endpoint is read from `ACCOUNT_HOST` or extracted from `AZURE_COSMOS_CONNECTION_STRING`.
+    async fn create_aad_client(
+        application_region: Option<RegionName>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let endpoint_url = Self::resolve_endpoint()?;
+        let endpoint: azure_data_cosmos::CosmosAccountEndpoint = endpoint_url.parse()?;
+
+        let credential = azure_core_test::credentials::from_env(None)?;
+
+        let mut builder = azure_data_cosmos::CosmosClient::builder();
+        if let Some(region) = application_region {
+            builder = builder.with_application_region(region);
+        }
+
+        let cosmos_client = builder
+            .build(azure_data_cosmos::CosmosAccountReference::with_credential(
+                endpoint, credential,
+            ))
+            .await?;
+
+        Ok(Self {
+            cosmos_client: Some(cosmos_client),
+            setup_client: None,
+        })
+    }
+
+    /// Resolves the Cosmos DB endpoint URL from environment variables.
+    ///
+    /// Checks `ACCOUNT_HOST` first, then falls back to parsing the endpoint from
+    /// `AZURE_COSMOS_CONNECTION_STRING`.
+    fn resolve_endpoint() -> Result<String, Box<dyn std::error::Error>> {
+        if let Ok(host) = std::env::var(ACCOUNT_HOST_ENV_VAR) {
+            let host = host.trim_end_matches('/');
+            if host.starts_with("https://") || host.starts_with("http://") {
+                return Ok(host.to_string());
+            }
+            return Ok(format!("https://{}", host));
+        }
+
+        // Fall back to parsing the connection string for the endpoint.
+        let conn_str = std::env::var(CONNECTION_STRING_ENV_VAR)
+            .map_err(|_| "Neither ACCOUNT_HOST nor AZURE_COSMOS_CONNECTION_STRING is set")?;
+        let parsed: ConnectionString = conn_str.parse()?;
+        Ok(parsed.account_endpoint.to_string())
     }
 
     async fn from_connection_string(
@@ -305,7 +384,8 @@ impl TestClient {
             .await?;
 
         Ok(TestClient {
-            cosmos_client: Some(cosmos_client),
+            cosmos_client: Some(cosmos_client.clone()),
+            setup_client: Some(cosmos_client),
         })
     }
 
@@ -381,8 +461,12 @@ impl TestClient {
 
         // CosmosClient is designed to be cloned cheaply, so we can clone it here.
         if let Some(account) = test_client.cosmos_client.clone() {
+            let setup = test_client
+                .setup_client
+                .clone()
+                .unwrap_or_else(|| account.clone());
             let fault_cosmos_client = fault_client.and_then(|fc| fc.cosmos_client);
-            let run = TestRunContext::new(account, fault_cosmos_client);
+            let run = TestRunContext::new(account, setup, fault_cosmos_client);
 
             // Apply timeout around entire test including retries on 429s
             let timeout = options.timeout.unwrap_or(DEFAULT_TEST_TIMEOUT);
@@ -459,9 +543,14 @@ impl TestClient {
         Self::run_with_options(
             async |run_context| {
                 // Ensure the shared database exists (create if needed, ignore conflict).
+                // Uses setup_client because database creation is a control plane operation.
                 let db_id = get_shared_database_id();
                 // Emulator is always strong consistency, so we can skip the read check in that case
-                match run_context.client().create_database(db_id, None).await {
+                match run_context
+                    .setup_client()
+                    .create_database(db_id, None)
+                    .await
+                {
                     Ok(_) => {}
                     Err(e) if e.http_status() == Some(StatusCode::Conflict) => {}
                     Err(e) => return Err(e.into()),
@@ -479,23 +568,34 @@ impl TestClient {
 /// Context for a test run, providing access to both normal and fault injection clients.
 ///
 /// The normal client is always available via `client()` and `shared_db_client()`.
+/// In AAD mode, `client()` returns the AAD-authenticated client for data-plane operations,
+/// while control-plane operations (create/delete databases and containers) use a
+/// key-authenticated client internally via `setup_client()`.
+///
 /// The fault injection client is available via `fault_client()` and `fault_db_client()`
 /// if `TestOptions::with_fault_injection_builder()` was called
 /// or if `TestOptions::with_fault_client_application_region()` was called.
 pub struct TestRunContext {
     run_id: String,
-    /// The normal (non-fault) Cosmos client.
+    /// The primary client used by tests. In AAD mode, this is AAD-authenticated.
     client: CosmosClient,
+    /// The key-auth client for control plane operations (create/delete DB/container).
+    setup_client: CosmosClient,
     /// The fault injection Cosmos client (if configured).
     fault_client: Option<CosmosClient>,
 }
 
 impl TestRunContext {
-    pub fn new(client: CosmosClient, fault_client: Option<CosmosClient>) -> Self {
+    pub fn new(
+        client: CosmosClient,
+        setup_client: CosmosClient,
+        fault_client: Option<CosmosClient>,
+    ) -> Self {
         let run_id = azure_core::Uuid::new_v4().simple().to_string();
         Self {
             run_id,
             client,
+            setup_client,
             fault_client,
         }
     }
@@ -508,8 +608,19 @@ impl TestRunContext {
     }
 
     /// Gets the underlying normal (non-fault) [`CosmosClient`].
+    ///
+    /// In AAD mode, this returns the AAD-authenticated client for data-plane operations.
+    /// In key mode (default), this returns the key-authenticated client.
     pub fn client(&self) -> &CosmosClient {
         &self.client
+    }
+
+    /// Gets the key-authenticated client used for control plane operations.
+    ///
+    /// Control plane operations (create/delete databases and containers) require key-based
+    /// auth because RBAC roles typically don't grant these permissions.
+    pub fn setup_client(&self) -> &CosmosClient {
+        &self.setup_client
     }
 
     /// Gets the fault injection [`CosmosClient`], if configured.
@@ -537,20 +648,23 @@ impl TestRunContext {
     }
 
     /// Creates a new, empty, database for this test run with default throughput options.
+    ///
+    /// Uses the key-authenticated setup client because database creation is a control plane
+    /// operation that requires key auth.
     pub async fn create_db(&self) -> azure_core::Result<DatabaseClient> {
         // The TestAccount has a unique context_id that includes the test name.
         let db_name = self.db_name();
-        let response = match self.client().create_database(&db_name, None).await {
+        let response = match self.setup_client().create_database(&db_name, None).await {
             // The database creation was successful.
             Ok(props) => props,
             Err(e) if e.http_status() == Some(StatusCode::Conflict) => {
                 // The database already exists, from a previous test run.
                 // Delete it and re-create it.
-                let db_client = self.client().database_client(&db_name);
+                let db_client = self.setup_client().database_client(&db_name);
                 db_client.delete(None).await?;
 
                 // Re-create the database.
-                self.client().create_database(&db_name, None).await?
+                self.setup_client().create_database(&db_name, None).await?
             }
             Err(e) => {
                 // Some other error occurred.
@@ -655,23 +769,28 @@ impl TestRunContext {
     }
 
     /// Creates a container with exponential backoff retries on 429 (Too Many Requests) errors.
-    /// This is useful for tests where rate limiting may cause transient failures.
+    ///
+    /// Uses the key-authenticated setup client because container creation is a control plane
+    /// operation. Returns a [`ContainerClient`] from the test-facing client for data-plane use.
     pub async fn create_container(
         &self,
         db_client: &DatabaseClient,
         properties: azure_data_cosmos::models::ContainerProperties,
         options: Option<azure_data_cosmos::CreateContainerOptions>,
     ) -> azure_core::Result<ContainerClient> {
+        // Use setup client's DatabaseClient for the control plane create operation.
+        let setup_db = self.setup_client().database_client(db_client.id());
         let mut backoff = Duration::from_millis(100);
         const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
         loop {
-            match db_client
+            match setup_db
                 .create_container(properties.clone(), options.clone())
                 .await
             {
                 Ok(response) => {
                     let created = response.into_model()?;
+                    // Return a ContainerClient from the test-facing client for data-plane ops.
                     return Ok(db_client.container_client(&created.id).await);
                 }
                 Err(e) if e.http_status() == Some(StatusCode::TooManyRequests) => {
@@ -683,15 +802,16 @@ impl TestRunContext {
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
                 Err(e) if e.http_status() == Some(StatusCode::Conflict) => {
-                    // Container already exists, delete and recreate it, then return a client
-                    let container_client = db_client.container_client(&properties.id).await;
+                    // Container already exists, delete and recreate it via setup client.
+                    let container_client = setup_db.container_client(&properties.id).await;
                     container_client.delete(None).await?;
 
                     // recreate
-                    let response = db_client
+                    let response = setup_db
                         .create_container(properties.clone(), options.clone())
                         .await?;
                     let created = response.into_model()?;
+                    // Return a ContainerClient from the test-facing client for data-plane ops.
                     return Ok(db_client.container_client(&created.id).await);
                 }
                 Err(e) => return Err(e),
@@ -700,6 +820,8 @@ impl TestRunContext {
     }
 
     /// Creates a container with specified throughput and waits for it to be fully created.
+    ///
+    /// Uses the key-authenticated setup client for the control plane create operation.
     ///
     /// This method:
     /// 1. Creates the container with the specified properties and throughput
@@ -715,7 +837,9 @@ impl TestRunContext {
         properties: azure_data_cosmos::models::ContainerProperties,
         throughput: ThroughputProperties,
     ) -> azure_core::Result<ContainerClient> {
-        let created_properties = db_client
+        // Use setup client for control plane container creation.
+        let setup_db = self.setup_client().database_client(db_client.id());
+        let created_properties = setup_db
             .create_container(
                 properties,
                 Some(CreateContainerOptions::default().with_throughput(throughput)),
@@ -812,6 +936,9 @@ impl TestRunContext {
 
     /// Cleans up test resources.
     ///
+    /// Uses the key-authenticated setup client because deleting databases is a control plane
+    /// operation.
+    ///
     /// This should be called at the end of a test run to delete any databases created during the test.
     /// If using [`TestClient::run`], this will be called automatically.
     pub async fn cleanup(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -819,17 +946,19 @@ impl TestRunContext {
             "SELECT * FROM root r WHERE r.id LIKE 'auto-test-{}'",
             self.run_id
         ));
-        let mut pager = self.client().query_databases(query, None)?;
+        let mut pager = self.setup_client().query_databases(query, None)?;
         let mut ids = Vec::new();
         while let Some(db) = pager.try_next().await? {
             ids.push(db.id);
         }
 
         // Now that we have a list of databases created by this test, we delete them.
-        // We COULD choose not to delete them and instead validate that they were deleted, but this is what I've gone with for now.
         for id in ids {
             println!("Deleting left-over database: {}", &id);
-            self.client().database_client(&id).delete(None).await?;
+            self.setup_client()
+                .database_client(&id)
+                .delete(None)
+                .await?;
         }
         Ok(())
     }
