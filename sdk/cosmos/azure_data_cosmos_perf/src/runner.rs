@@ -56,6 +56,22 @@ struct PerfResult {
     system_cpu_percent: f32,
     system_total_memory_bytes: u64,
     system_used_memory_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_workers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_busy_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_polls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_mean_poll_us: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_steal_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_overflow_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_park_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokio_queue_depth: Option<u64>,
 }
 
 /// Error document written to the results container for each individual operation failure.
@@ -128,6 +144,10 @@ pub async fn run(config: RunConfig) {
         });
     }
 
+    // Set up tokio runtime metrics monitor
+    #[cfg(feature = "tokio-metrics")]
+    let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&tokio::runtime::Handle::current());
+
     // Start periodic reporter
     let report_stats = stats.clone();
     let report_cancel = cancelled.clone();
@@ -135,6 +155,9 @@ pub async fn run(config: RunConfig) {
     let report_workload_id = workload_id.clone();
     let report_commit_sha = commit_sha.clone();
     let report_hostname = hostname.clone();
+    #[cfg(feature = "tokio-metrics")]
+    let mut runtime_intervals = runtime_monitor.intervals();
+
     let reporter = tokio::spawn(async move {
         let mut sys = System::new();
         let mut interval = tokio::time::interval(report_interval);
@@ -149,12 +172,36 @@ pub async fn run(config: RunConfig) {
             if let Some(ref m) = metrics {
                 stats::print_process_metrics(m);
             }
+
+            // Collect tokio runtime metrics (delta since last interval)
+            #[cfg(feature = "tokio-metrics")]
+            let tokio_fields = {
+                runtime_intervals.next().map(|rt| {
+                    let workers = rt.workers_count as u64;
+                    let interval_secs = report_interval.as_secs_f64();
+                    let busy_nanos = rt.total_busy_duration.as_nanos() as f64;
+                    let total_nanos = interval_secs * 1e9 * workers as f64;
+                    let busy_pct = if total_nanos > 0.0 { busy_nanos / total_nanos * 100.0 } else { 0.0 };
+                    let polls = rt.total_polls_count;
+                    let mean_poll_us = if polls > 0 {
+                        rt.total_busy_duration.as_micros() as f64 / polls as f64
+                    } else { 0.0 };
+                    println!("  Tokio:   Workers={}, Busy={:.1}%, Polls={}, MeanPoll={:.1}\u{00b5}s, Steals={}, Overflow={}",
+                        workers, busy_pct, polls, mean_poll_us, rt.total_steal_count, rt.total_overflow_count);
+                    (workers, busy_pct, polls, mean_poll_us, rt.total_steal_count,
+                     rt.total_overflow_count, rt.total_park_count, rt.total_local_queue_depth as u64)
+                })
+            };
+            #[cfg(not(feature = "tokio-metrics"))]
+            let tokio_fields: Option<(u64, f64, u64, f64, u64, u64, u64, u64)> = None;
+
             let summaries = report_stats.drain_summaries();
             stats::print_report(&summaries);
             upsert_results(
                 &report_results_container,
                 &summaries,
                 metrics.as_ref(),
+                tokio_fields,
                 &report_workload_id,
                 &report_commit_sha,
                 &report_hostname,
@@ -224,6 +271,7 @@ pub async fn run(config: RunConfig) {
         &results_container,
         &summaries,
         metrics.as_ref(),
+        None,
         &workload_id,
         &commit_sha,
         &hostname,
@@ -238,6 +286,7 @@ async fn upsert_results(
     container: &ContainerClient,
     summaries: &[stats::Summary],
     metrics: Option<&stats::ProcessMetrics>,
+    tokio_fields: Option<(u64, f64, u64, f64, u64, u64, u64, u64)>,
     workload_id: &str,
     commit_sha: &str,
     hostname: &str,
@@ -279,6 +328,14 @@ async fn upsert_results(
             system_cpu_percent: sys_cpu,
             system_total_memory_bytes: sys_total,
             system_used_memory_bytes: sys_used,
+            tokio_workers: tokio_fields.map(|t| t.0),
+            tokio_busy_pct: tokio_fields.map(|t| t.1),
+            tokio_polls: tokio_fields.map(|t| t.2),
+            tokio_mean_poll_us: tokio_fields.map(|t| t.3),
+            tokio_steal_count: tokio_fields.map(|t| t.4),
+            tokio_overflow_count: tokio_fields.map(|t| t.5),
+            tokio_park_count: tokio_fields.map(|t| t.6),
+            tokio_queue_depth: tokio_fields.map(|t| t.7),
         };
 
         if let Err(e) = container
