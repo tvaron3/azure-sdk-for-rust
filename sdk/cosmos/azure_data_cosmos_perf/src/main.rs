@@ -3,6 +3,11 @@
 
 use azure_data_cosmos::models::TimeToLive;
 
+#[cfg(feature = "pyroscope")]
+use pyroscope::pyroscope::PyroscopeAgentBuilder;
+#[cfg(feature = "pyroscope")]
+use pyroscope_pprofrs::{pprof_backend, PprofConfig};
+
 mod config;
 mod operations;
 mod runner;
@@ -222,6 +227,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
+    // Initialize Pyroscope continuous profiling (if compiled in and server URL is set)
+    #[cfg(feature = "pyroscope")]
+    let _pyroscope_agent = {
+        match std::env::var("PYROSCOPE_SERVER_URL") {
+            Ok(url) if !url.is_empty() => {
+                println!("Pyroscope profiling enabled \u{2014} pushing to {url}");
+                let backend = pprof_backend(PprofConfig::new().sample_rate(99));
+                match PyroscopeAgentBuilder::new(url, "cosmos-perf")
+                    .backend(backend)
+                    .tags(vec![
+                        ("commit_sha", commit_sha.as_str()),
+                        ("hostname", hostname.as_str()),
+                    ])
+                    .build()
+                {
+                    Ok(agent) => match agent.start() {
+                        Ok(running) => Some(running),
+                        Err(e) => {
+                            eprintln!("Warning: failed to start Pyroscope agent: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Warning: failed to build Pyroscope agent: {e}");
+                        None
+                    }
+                }
+            }
+            _ => {
+                println!("Pyroscope profiling disabled (PYROSCOPE_SERVER_URL not set)");
+                None
+            }
+        }
+    };
+
     // Run the perf test
     let op_names: Vec<&str> = ops.iter().map(|op| op.name()).collect();
     let stats = Arc::new(Stats::new(&op_names));
@@ -238,6 +278,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hostname,
     })
     .await;
+
+    // Stop Pyroscope agent gracefully
+    #[cfg(feature = "pyroscope")]
+    if let Some(agent) = _pyroscope_agent {
+        match agent.stop() {
+            Ok(_ready) => println!("Pyroscope agent stopped."),
+            Err(e) => eprintln!("Warning: failed to stop Pyroscope agent: {e}"),
+        }
+    }
 
     Ok(())
 }
