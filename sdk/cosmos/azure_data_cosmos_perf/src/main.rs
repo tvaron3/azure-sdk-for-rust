@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use crate::config::{AuthMethod, Config};
     use crate::operations::create_operations;
-    use crate::runner::RunConfig;
+    use crate::runner::{ConfigSnapshot, RunConfig};
     use crate::stats::Stats;
 
     let config = Config::parse();
@@ -262,6 +262,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Build config snapshot for dashboard metadata
+    let tokio_threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get() as u64).unwrap_or(1));
+
+    let config_snapshot = ConfigSnapshot {
+        concurrency: config.concurrency as u64,
+        application_region: config.application_region.clone(),
+        excluded_regions: config.excluded_regions.join(","),
+        tokio_threads,
+        ppcb_enabled: std::env::var("AZURE_COSMOS_PER_PARTITION_CIRCUIT_BREAKER_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        gateway20_allowed: std::env::var("AZURE_COSMOS_CONNECTION_POOL_IS_GATEWAY20_ALLOWED")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true),
+        pyroscope_enabled: std::env::var("PYROSCOPE_SERVER_URL")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false),
+        tokio_console_enabled: cfg!(feature = "tokio-console"),
+        tokio_metrics_enabled: cfg!(feature = "tokio-metrics"),
+        valgrind_tool: std::env::var("VALGRIND_TOOL").unwrap_or_default(),
+    };
+
     // Run the perf test
     let op_names: Vec<&str> = ops.iter().map(|op| op.name()).collect();
     let stats = Arc::new(Stats::new(&op_names));
@@ -276,6 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workload_id: config.workload_id,
         commit_sha,
         hostname,
+        config_snapshot,
     })
     .await;
 

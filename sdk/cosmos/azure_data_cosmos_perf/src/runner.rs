@@ -56,6 +56,18 @@ struct PerfResult {
     system_cpu_percent: f32,
     system_total_memory_bytes: u64,
     system_used_memory_bytes: u64,
+    // Config metadata
+    config_concurrency: u64,
+    config_application_region: String,
+    config_excluded_regions: String,
+    config_tokio_threads: u64,
+    config_ppcb_enabled: bool,
+    config_gateway20_allowed: bool,
+    config_pyroscope_enabled: bool,
+    config_tokio_console_enabled: bool,
+    config_tokio_metrics_enabled: bool,
+    config_valgrind_tool: String,
+    // Tokio runtime metrics
     #[serde(skip_serializing_if = "Option::is_none")]
     tokio_workers: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +101,21 @@ struct ErrorResult {
     source_message: Option<String>,
 }
 
+/// Snapshot of benchmark and SDK configuration for dashboard visibility.
+#[derive(Clone)]
+pub struct ConfigSnapshot {
+    pub concurrency: u64,
+    pub application_region: String,
+    pub excluded_regions: String,
+    pub tokio_threads: u64,
+    pub ppcb_enabled: bool,
+    pub gateway20_allowed: bool,
+    pub pyroscope_enabled: bool,
+    pub tokio_console_enabled: bool,
+    pub tokio_metrics_enabled: bool,
+    pub valgrind_tool: String,
+}
+
 /// Configuration for a perf test run.
 pub struct RunConfig {
     pub container: ContainerClient,
@@ -101,6 +128,7 @@ pub struct RunConfig {
     pub workload_id: String,
     pub commit_sha: String,
     pub hostname: String,
+    pub config_snapshot: ConfigSnapshot,
 }
 
 /// Runs operations concurrently until cancelled or duration expires.
@@ -121,6 +149,7 @@ pub async fn run(config: RunConfig) {
         workload_id,
         commit_sha,
         hostname,
+        config_snapshot,
     } = config;
     let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -155,6 +184,7 @@ pub async fn run(config: RunConfig) {
     let report_workload_id = workload_id.clone();
     let report_commit_sha = commit_sha.clone();
     let report_hostname = hostname.clone();
+    let config_snapshot = config_snapshot.clone();
     #[cfg(feature = "tokio-metrics")]
     let mut runtime_intervals = runtime_monitor.intervals();
 
@@ -205,6 +235,7 @@ pub async fn run(config: RunConfig) {
                 &report_workload_id,
                 &report_commit_sha,
                 &report_hostname,
+                &config_snapshot,
             )
             .await;
         }
@@ -275,6 +306,7 @@ pub async fn run(config: RunConfig) {
         &workload_id,
         &commit_sha,
         &hostname,
+        &config_snapshot,
     )
     .await;
 
