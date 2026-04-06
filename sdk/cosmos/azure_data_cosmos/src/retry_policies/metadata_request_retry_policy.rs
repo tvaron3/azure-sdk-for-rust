@@ -291,6 +291,7 @@ mod tests {
             vec![Region::from("West US"), Region::from("East US")],
             vec![],
             pipeline,
+            vec![],
         )
     }
 
@@ -309,6 +310,7 @@ mod tests {
             vec![],
             vec![],
             pipeline,
+            vec![],
         )
     }
 
@@ -327,6 +329,7 @@ mod tests {
             vec![Region::EAST_ASIA, Region::WEST_US, Region::NORTH_CENTRAL_US],
             vec![],
             pipeline,
+            vec![],
         )
     }
 

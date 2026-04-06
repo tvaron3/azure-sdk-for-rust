@@ -23,6 +23,7 @@ use std::error::Error as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
 
 use super::{
     cache::AccountRegion,
@@ -165,6 +166,8 @@ impl CosmosDriver {
     /// incompatibility signal, falls back to HTTP/1.1 using the same
     /// emulator-aware metadata transport selection as the steady-state path.
     ///
+    /// If the primary endpoint fails, tries each backup endpoint in order.
+    ///
     /// Callers that need to force HTTP/1.1 can disable HTTP/2 in
     /// [`crate::options::ConnectionPoolOptionsBuilder::with_is_http2_allowed`].
     /// The returned version is used to create the per-account `CosmosTransport`.
@@ -172,8 +175,52 @@ impl CosmosDriver {
         runtime: &CosmosDriverRuntime,
         account: &AccountReference,
     ) -> azure_core::Result<(TransportHttpVersion, super::cache::AccountProperties)> {
+        match Self::probe_http_version_for_endpoint(runtime, account).await {
+            Ok(result) => Ok(result),
+            Err(primary_error) if !account.backup_endpoints().is_empty() => {
+                tracing::warn!(
+                    endpoint = %AccountEndpoint::from(account),
+                    error = %primary_error,
+                    "primary endpoint probe failed; trying backup endpoints"
+                );
+
+                for backup_url in account.backup_endpoints() {
+                    let backup_account = Self::with_endpoint(account, backup_url.clone());
+                    match Self::probe_http_version_for_endpoint(runtime, &backup_account).await {
+                        Ok(result) => {
+                            tracing::info!(
+                                backup_endpoint = %backup_url,
+                                "backup endpoint probe succeeded"
+                            );
+                            return Ok(result);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                backup_endpoint = %backup_url,
+                                error = %e,
+                                "backup endpoint probe failed; trying next"
+                            );
+                        }
+                    }
+                }
+
+                tracing::error!(
+                    endpoint = %AccountEndpoint::from(account),
+                    backup_count = account.backup_endpoints().len(),
+                    "all endpoints exhausted during HTTP version probe"
+                );
+                Err(primary_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Probes the HTTP version for a single endpoint.
+    async fn probe_http_version_for_endpoint(
+        runtime: &CosmosDriverRuntime,
+        account: &AccountReference,
+    ) -> azure_core::Result<(TransportHttpVersion, super::cache::AccountProperties)> {
         if !runtime.connection_pool().is_http2_allowed() {
-            // User explicitly disabled HTTP/2 — skip the probe.
             let (props, _) = Self::fetch_account_properties_with_version(
                 runtime,
                 account,
@@ -183,7 +230,6 @@ impl CosmosDriver {
             return Ok((TransportHttpVersion::Http11, props));
         }
 
-        // Try HTTP/2-only via the bootstrap transport (which is HTTP/2-only).
         match Self::fetch_account_properties_with_runtime(runtime, account).await {
             Ok(props) => {
                 tracing::trace!(
@@ -215,6 +261,21 @@ impl CosmosDriver {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Creates an `AccountReference` with a different endpoint but same credentials.
+    /// Used for probing backup endpoints.
+    /// Creates a temporary `AccountReference` targeting a single backup endpoint.
+    ///
+    /// `backup_endpoints` are intentionally omitted: this reference is used for
+    /// a single-endpoint probe inside the fallback loop and must not trigger
+    /// its own recursive fallback.
+    fn with_endpoint(account: &AccountReference, endpoint: Url) -> AccountReference {
+        // unwrap is safe: we always provide credentials via auth()
+        AccountReference::builder(endpoint)
+            .auth(account.auth().clone())
+            .build()
+            .unwrap()
     }
 
     /// Fetches account properties using a specific adaptive transport.
@@ -290,7 +351,9 @@ impl CosmosDriver {
 
     /// Fetches account properties using the current per-account transport.
     ///
-    /// Uses the existing transport for the refresh.
+    /// Uses the existing transport for the refresh. If the primary endpoint
+    /// fails and backup endpoints are configured, tries each backup endpoint
+    /// in order.
     ///
     /// - **HTTP/1.1 success**: opportunistically re-probes HTTP/2 and upgrades
     ///   the transport on success.
@@ -304,6 +367,60 @@ impl CosmosDriver {
     /// HTTP/1.1 or when the active transport actually fails, both of which are
     /// expected to be rare in steady-state operation.
     async fn refresh_account_properties(
+        runtime: &CosmosDriverRuntime,
+        account: &AccountReference,
+        transport_holder: &Arc<ArcSwap<CosmosTransport>>,
+    ) -> azure_core::Result<super::cache::AccountProperties> {
+        match Self::refresh_account_properties_for_endpoint(runtime, account, transport_holder)
+            .await
+        {
+            Ok(props) => Ok(props),
+            Err(primary_error) if !account.backup_endpoints().is_empty() => {
+                tracing::warn!(
+                    endpoint = %AccountEndpoint::from(account),
+                    error = %primary_error,
+                    "primary endpoint refresh failed; trying backup endpoints"
+                );
+
+                for backup_url in account.backup_endpoints() {
+                    let backup_account = Self::with_endpoint(account, backup_url.clone());
+                    match Self::refresh_account_properties_for_endpoint(
+                        runtime,
+                        &backup_account,
+                        transport_holder,
+                    )
+                    .await
+                    {
+                        Ok(props) => {
+                            tracing::info!(
+                                backup_endpoint = %backup_url,
+                                "backup endpoint refresh succeeded"
+                            );
+                            return Ok(props);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                backup_endpoint = %backup_url,
+                                error = %e,
+                                "backup endpoint refresh failed; trying next"
+                            );
+                        }
+                    }
+                }
+
+                tracing::error!(
+                    endpoint = %AccountEndpoint::from(account),
+                    backup_count = account.backup_endpoints().len(),
+                    "all endpoints exhausted during account properties refresh"
+                );
+                Err(primary_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Refreshes account properties for a single endpoint.
+    async fn refresh_account_properties_for_endpoint(
         runtime: &CosmosDriverRuntime,
         account: &AccountReference,
         transport_holder: &Arc<ArcSwap<CosmosTransport>>,

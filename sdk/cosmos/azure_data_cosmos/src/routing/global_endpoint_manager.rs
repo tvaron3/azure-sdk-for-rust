@@ -35,6 +35,9 @@ pub(crate) struct GlobalEndpointManager {
     /// The primary default endpoint URL for the Cosmos DB account
     default_endpoint: Url,
 
+    /// Fallback endpoints tried when the primary endpoint is unavailable
+    backup_endpoints: Vec<Url>,
+
     /// Thread-safe cache of location information including read/write endpoints and availability status
     location_cache: Mutex<LocationCache>,
 
@@ -64,6 +67,7 @@ impl Debug for GlobalEndpointManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GlobalEndpointManager")
             .field("default_endpoint", &self.default_endpoint)
+            .field("backup_endpoints", &self.backup_endpoints)
             .field("location_cache", &self.location_cache)
             .field("pipeline", &self.pipeline)
             .field("account_properties_cache", &self.account_properties_cache)
@@ -87,6 +91,7 @@ impl GlobalEndpointManager {
     /// * `preferred_locations` - Ordered list of preferred Azure regions for request routing
     /// * `excluded_regions` - List of regions to exclude from routing
     /// * `pipeline` - HTTP pipeline for making service requests
+    /// * `backup_endpoints` - Ordered fallback endpoint URLs tried when the primary endpoint is unavailable
     ///
     /// # Returns
     /// A new `GlobalEndpointManager` instance ready for request routing
@@ -95,6 +100,7 @@ impl GlobalEndpointManager {
         preferred_locations: Vec<Region>,
         excluded_regions: Vec<Region>,
         pipeline: Pipeline,
+        backup_endpoints: Vec<Url>,
     ) -> Arc<Self> {
         let location_cache = Mutex::new(LocationCache::new(
             default_endpoint.clone(),
@@ -108,6 +114,7 @@ impl GlobalEndpointManager {
 
         let instance = Arc::new(Self {
             default_endpoint,
+            backup_endpoints,
             location_cache,
             pipeline,
             account_properties_cache,
@@ -442,14 +449,65 @@ impl GlobalEndpointManager {
     /// # Returns
     /// `Ok(Response<AccountProperties>)` with account metadata, or `Err` if request failed
     pub async fn get_database_account(&self) -> azure_core::Result<Response<AccountProperties>> {
+        match self.get_database_account_from_endpoint(None).await {
+            Ok(response) => Ok(response),
+            Err(primary_error) if !self.backup_endpoints.is_empty() => {
+                tracing::warn!(
+                    endpoint = %self.default_endpoint,
+                    error = %primary_error,
+                    "primary endpoint account fetch failed; trying backup endpoints"
+                );
+
+                for backup_url in &self.backup_endpoints {
+                    match self
+                        .get_database_account_from_endpoint(Some(backup_url.clone()))
+                        .await
+                    {
+                        Ok(response) => {
+                            tracing::info!(
+                                backup_endpoint = %backup_url,
+                                "backup endpoint account fetch succeeded"
+                            );
+                            return Ok(response);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                backup_endpoint = %backup_url,
+                                error = %e,
+                                "backup endpoint account fetch failed; trying next"
+                            );
+                        }
+                    }
+                }
+
+                tracing::error!(
+                    endpoint = %self.default_endpoint,
+                    backup_count = self.backup_endpoints.len(),
+                    "all endpoints exhausted during account properties fetch"
+                );
+                Err(primary_error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Fetches database account properties from a specific endpoint.
+    ///
+    /// If `endpoint_override` is `None`, uses the endpoint resolved from the
+    /// location cache. Otherwise uses the provided endpoint directly.
+    async fn get_database_account_from_endpoint(
+        &self,
+        endpoint_override: Option<Url>,
+    ) -> azure_core::Result<Response<AccountProperties>> {
         let resource_link = ResourceLink::root(ResourceType::DatabaseAccount);
         let builder = CosmosRequest::builder(OperationType::Read, resource_link.clone());
         let mut cosmos_request = builder.build()?;
-        let endpoint = self
-            .location_cache
-            .lock()
-            .unwrap()
-            .resolve_service_endpoint(&cosmos_request);
+        let endpoint = endpoint_override.unwrap_or_else(|| {
+            self.location_cache
+                .lock()
+                .unwrap()
+                .resolve_service_endpoint(&cosmos_request)
+        });
         cosmos_request.request_context.location_endpoint_to_route = Some(endpoint);
         let ctx_owned = Context::default().with_value(resource_link);
         self.pipeline
@@ -575,6 +633,7 @@ mod tests {
             vec![Region::from("West US"), Region::from("East US")],
             vec![],
             create_test_pipeline(),
+            vec![],
         )
     }
 

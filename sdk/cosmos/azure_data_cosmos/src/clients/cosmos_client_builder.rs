@@ -87,6 +87,8 @@ pub struct CosmosClientBuilder {
     /// Fault injection builder for testing error handling
     #[cfg(feature = "fault_injection")]
     fault_injection_builder: Option<crate::fault_injection::FaultInjectionClientBuilder>,
+    /// Fallback endpoints tried when the primary endpoint is unavailable.
+    backup_endpoints: Vec<azure_core::http::Url>,
 }
 
 impl CosmosClientBuilder {
@@ -159,6 +161,22 @@ impl CosmosClientBuilder {
     /// * `allow` - Whether to allow proxy usage.
     pub fn with_proxy_allowed(mut self, allow: bool) -> Self {
         self.allow_proxy = allow;
+        self
+    }
+
+    /// Sets backup endpoints that the client will try when the primary global
+    /// endpoint is unavailable.
+    ///
+    /// During initialization and periodic account metadata refreshes, if the
+    /// primary endpoint fails, the SDK will try each backup endpoint in order
+    /// until one succeeds. A successful connection allows normal service
+    /// discovery to proceed.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoints` - Ordered list of fallback endpoint URLs.
+    pub fn with_backup_endpoints(mut self, endpoints: Vec<crate::CosmosAccountEndpoint>) -> Self {
+        self.backup_endpoints = endpoints.into_iter().map(|e| e.into_url()).collect();
         self
     }
 
@@ -317,6 +335,7 @@ impl CosmosClientBuilder {
             preferred_regions,
             Vec::new(),
             pipeline_core.clone(),
+            self.backup_endpoints.clone(),
         );
 
         // Enable per-partition circuit breaker based on the
@@ -364,7 +383,8 @@ impl CosmosClientBuilder {
         // TODO: Each CosmosClient currently creates its own CosmosDriverRuntime. The runtime
         // should be shared across clients targeting the same account to avoid duplicate
         // background tasks and connection pools. See https://github.com/Azure/azure-sdk-for-rust/issues/3908
-        let driver_account = build_driver_account(endpoint, driver_credential);
+        let driver_account =
+            build_driver_account(endpoint, driver_credential, self.backup_endpoints);
         #[allow(unused_mut)]
         let mut driver_runtime_builder = CosmosDriverRuntimeBuilder::new();
         #[cfg(feature = "allow_invalid_certificates")]
@@ -401,8 +421,9 @@ impl CosmosClientBuilder {
 fn build_driver_account(
     endpoint: azure_core::http::Url,
     credential: CosmosCredential,
+    backup_endpoints: Vec<azure_core::http::Url>,
 ) -> azure_data_cosmos_driver::models::AccountReference {
-    match credential {
+    let base = match credential {
         CosmosCredential::TokenCredential(tc) => {
             azure_data_cosmos_driver::models::AccountReference::with_credential(endpoint, tc)
         }
@@ -410,6 +431,11 @@ fn build_driver_account(
         CosmosCredential::MasterKey(key) => {
             azure_data_cosmos_driver::models::AccountReference::with_master_key(endpoint, key)
         }
+    };
+    if backup_endpoints.is_empty() {
+        base
+    } else {
+        base.with_backup_endpoints(backup_endpoints)
     }
 }
 

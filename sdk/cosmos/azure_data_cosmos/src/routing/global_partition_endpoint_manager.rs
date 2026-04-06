@@ -1136,6 +1136,7 @@ mod tests {
             vec![Region::from("West US")],
             vec![],
             create_test_pipeline(),
+            vec![],
         )
     }
 
@@ -1145,6 +1146,7 @@ mod tests {
             vec![Region::from("West US"), Region::from("East US")],
             vec![],
             create_test_pipeline(),
+            vec![],
         );
 
         let west = AccountRegion {
@@ -1170,6 +1172,7 @@ mod tests {
             ],
             vec![],
             create_test_pipeline(),
+            vec![],
         );
 
         let west = AccountRegion {
@@ -1202,6 +1205,7 @@ mod tests {
             vec![Region::from("West US"), Region::from("East US")],
             vec![],
             create_test_pipeline(),
+            vec![],
         );
 
         let west = AccountRegion {
