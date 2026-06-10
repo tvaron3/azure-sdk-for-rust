@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use azure_data_cosmos::options::QueryOptions;
 use azure_data_cosmos::Query;
 use azure_data_cosmos::{clients::ContainerClient, query::FeedScope};
 use futures::StreamExt;
@@ -17,12 +18,13 @@ use crate::seed::SharedItems;
 /// Runs a single-partition query against a random seeded partition key.
 pub struct QueryItemsOperation {
     items: Arc<SharedItems>,
+    options: Option<QueryOptions>,
 }
 
 impl QueryItemsOperation {
     /// Creates a new query operation targeting the given seeded items.
-    pub fn new(items: Arc<SharedItems>) -> Self {
-        Self { items }
+    pub fn new(items: Arc<SharedItems>, options: Option<QueryOptions>) -> Self {
+        Self { items, options }
     }
 }
 
@@ -45,7 +47,7 @@ impl Operation for QueryItemsOperation {
         let mut stream = Box::pin(container.query_items::<serde_json::Value>(
             query,
             FeedScope::partition(pk),
-            None,
+            self.options.clone(),
         ))
         .await?
         .into_pages();

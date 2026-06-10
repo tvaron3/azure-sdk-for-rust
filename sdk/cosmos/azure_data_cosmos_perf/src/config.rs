@@ -47,6 +47,34 @@ pub struct Config {
     #[arg(long, value_enum, default_value_t = ExcludeRegionsScope::Both)]
     pub exclude_regions_for: ExcludeRegionsScope,
 
+    /// Disable the SDK's automatic session-token capture and propagation.
+    ///
+    /// When set, the perf workload requests
+    /// `OperationOptions.session_capturing_disabled = Some(true)` on every
+    /// read and write, so the SDK neither captures session tokens from
+    /// responses nor sends them on subsequent requests.
+    #[arg(long, default_value_t = false)]
+    pub no_session_token: bool,
+
+    /// Cross-region hedging override applied to every operation.
+    ///
+    /// `default` inherits the SDK / account / runtime default.
+    /// `on` forces hedging with the threshold from `--hedging-threshold-ms`.
+    /// `off` explicitly disables hedging for this workload.
+    ///
+    /// Note: the current SDK only effectively hedges eligible point reads;
+    /// the override is attached to writes/queries too but the driver does
+    /// not race them.
+    #[arg(long, value_enum, default_value_t = HedgingMode::Default)]
+    pub hedging: HedgingMode,
+
+    /// Hedge threshold in milliseconds, used only when `--hedging on`.
+    ///
+    /// Must be > 0 — the SDK rejects a zero threshold. Ignored when
+    /// `--hedging` is `default` or `off`.
+    #[arg(long, default_value_t = 500)]
+    pub hedging_threshold_ms: u64,
+
     /// Disable point read operations.
     #[arg(long, default_value_t = false)]
     pub no_reads: bool,
@@ -170,4 +198,38 @@ pub enum ExcludeRegionsScope {
     Writes,
     /// Exclude regions for both reads and writes.
     Both,
+}
+
+/// Cross-region hedging override applied to every operation issued by the
+/// perf workload.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HedgingMode {
+    /// Inherit the SDK / account / runtime default for hedging.
+    Default,
+    /// Force hedging on with `--hedging-threshold-ms`.
+    On,
+    /// Explicitly disable hedging for this workload.
+    Off,
+}
+
+impl HedgingMode {
+    /// Wire-format string used in result documents.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HedgingMode::Default => "default",
+            HedgingMode::On => "on",
+            HedgingMode::Off => "off",
+        }
+    }
+}
+
+impl ExcludeRegionsScope {
+    /// Wire-format string used in result documents.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExcludeRegionsScope::Reads => "reads",
+            ExcludeRegionsScope::Writes => "writes",
+            ExcludeRegionsScope::Both => "both",
+        }
+    }
 }

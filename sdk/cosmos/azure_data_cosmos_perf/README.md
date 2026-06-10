@@ -63,7 +63,10 @@ cargo run -p azure_data_cosmos_perf -- \
 | `--key` | — | Account key (or set `AZURE_COSMOS_KEY` env var) |
 | `--application-region` | *required* | Azure region where the application is running (e.g., `"East US 2"`) |
 | `--excluded-regions` | — | Comma-separated excluded regions |
-| `--exclude-regions-for` | `both` | Scope for excluded regions: `reads`, `writes`, or `both` |
+| `--exclude-regions-for` | `both` | Scope for excluded regions: `reads` (includes queries), `writes`, or `both` |
+| `--no-session-token` | `false` | Disable the SDK's automatic session-token capture/send for all reads and writes |
+| `--hedging` | `default` | Cross-region hedging override applied to all operations: `default` (inherit), `on`, or `off`. The current SDK only effectively hedges eligible point reads — the value is stamped on every result row (including writes/queries) as operator intent, but write/query rows will not show hedged latency behavior even when set to `on`. |
+| `--hedging-threshold-ms` | `500` | Hedge threshold in milliseconds (only used when `--hedging on`; must be > 0) |
 | `--concurrency` | `50` | Number of concurrent operations |
 | `--duration` | indefinite | Run duration in seconds |
 | `--seed-count` | `1000` | Number of items to pre-seed |

@@ -90,6 +90,16 @@ struct PerfResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     config_excluded_regions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    config_excluded_regions_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_routing_strategy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_session_token_disabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_hedging_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_hedging_threshold_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     config_tokio_threads: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     config_ppcb_enabled: Option<bool>,
@@ -150,6 +160,17 @@ pub struct ConfigSnapshot {
     pub concurrency: u64,
     pub application_region: String,
     pub excluded_regions: String,
+    /// Scope the excluded regions apply to (`reads`/`writes`/`both`).
+    /// `None` when no excluded regions are configured.
+    pub excluded_regions_scope: Option<String>,
+    /// Routing strategy used by the client (e.g. `ProximityTo`).
+    pub routing_strategy: String,
+    /// Whether the SDK's automatic session-token capture/send is disabled.
+    pub session_token_disabled: bool,
+    /// Hedging mode applied to every operation (`default`/`on`/`off`).
+    pub hedging_mode: String,
+    /// Hedge threshold in milliseconds — populated only when `hedging_mode == "on"`.
+    pub hedging_threshold_ms: Option<u64>,
     pub tokio_threads: u64,
     pub ppcb_enabled: bool,
     pub gateway20_allowed: bool,
@@ -415,6 +436,11 @@ async fn upsert_results(
             } else {
                 Some(config.excluded_regions.clone())
             },
+            config_excluded_regions_scope: config.excluded_regions_scope.clone(),
+            config_routing_strategy: Some(config.routing_strategy.clone()),
+            config_session_token_disabled: Some(config.session_token_disabled),
+            config_hedging_mode: Some(config.hedging_mode.clone()),
+            config_hedging_threshold_ms: config.hedging_threshold_ms,
             config_tokio_threads: Some(config.tokio_threads),
             config_ppcb_enabled: Some(config.ppcb_enabled),
             config_gateway20_allowed: Some(config.gateway20_allowed),

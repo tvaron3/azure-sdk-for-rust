@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 use azure_data_cosmos::models::TimeToLive;
+use azure_data_cosmos::RoutingStrategy;
 
 mod config;
 mod operations;
@@ -31,6 +32,21 @@ fn create_aad_credential(
                 })
         })
         .map_err(|e| e.into())
+}
+
+/// Returns the stable string label for a [`RoutingStrategy`] variant used in
+/// per-result `config_routing_strategy` stamps.
+///
+/// Centralizing this here keeps the value emitted into result documents tied
+/// to the same enum the SDK client is built with, so adding a new variant
+/// forces a compile error here rather than silently mis-labeling rows.
+fn routing_strategy_label(strategy: &RoutingStrategy) -> &'static str {
+    match strategy {
+        RoutingStrategy::ProximityTo(_) => "ProximityTo",
+        RoutingStrategy::PreferredRegions(_) => "PreferredRegions",
+        // RoutingStrategy is #[non_exhaustive]; new variants need an explicit label here.
+        _ => "unknown",
+    }
 }
 
 #[tokio::main]
@@ -104,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     use clap::Parser;
 
-    use crate::config::{AuthMethod, Config};
+    use crate::config::{AuthMethod, Config, HedgingMode};
     use crate::operations::create_operations;
     use crate::runner::{ConfigSnapshot, RunConfig};
     use crate::stats::Stats;
@@ -126,6 +142,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if config.seed_count == 0 {
         eprintln!("Error: --seed-count must be at least 1.");
+        std::process::exit(1);
+    }
+    if config.hedging == HedgingMode::On && config.hedging_threshold_ms == 0 {
+        eprintln!("Error: --hedging-threshold-ms must be > 0 when --hedging is 'on'.");
         std::process::exit(1);
     }
 
@@ -157,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let application_region: azure_data_cosmos::regions::Region =
         config.application_region.clone().into();
     let strategy = RoutingStrategy::ProximityTo(application_region.clone());
+    let routing_strategy_label = routing_strategy_label(&strategy);
 
     let mut builder = CosmosClientBuilder::new();
     if let Some(s) = user_agent_suffix.clone() {
@@ -305,10 +326,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "unknown".to_string());
 
     // Build config snapshot for Grafana dashboard visibility
+    let excluded_regions_scope = if config.excluded_regions.is_empty() {
+        None
+    } else {
+        Some(config.exclude_regions_for.as_str().to_string())
+    };
+    let hedging_threshold_ms = if config.hedging == HedgingMode::On {
+        Some(config.hedging_threshold_ms)
+    } else {
+        None
+    };
     let config_snapshot = ConfigSnapshot {
         concurrency: config.concurrency as u64,
         application_region: config.application_region.clone(),
         excluded_regions: config.excluded_regions.join(", "),
+        excluded_regions_scope,
+        routing_strategy: routing_strategy_label.to_string(),
+        session_token_disabled: config.no_session_token,
+        hedging_mode: config.hedging.as_str().to_string(),
+        hedging_threshold_ms,
         tokio_threads: tokio::runtime::Handle::current().metrics().num_workers() as u64,
         ppcb_enabled: std::env::var("AZURE_COSMOS_PER_PARTITION_CIRCUIT_BREAKER_ENABLED")
             .ok()
