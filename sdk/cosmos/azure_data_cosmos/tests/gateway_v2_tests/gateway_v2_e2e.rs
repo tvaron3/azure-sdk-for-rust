@@ -11,7 +11,8 @@ use azure_data_cosmos::models::{
 };
 use azure_data_cosmos::options::{
     CreateContainerOptions, ItemReadOptions, ItemWriteOptions, MaxItemCountHint,
-    OperationOptionsBuilder, Precondition, QueryOptions, ReadConsistencyStrategy, Region,
+    OperationOptionsBuilder, PartitionFailoverOptions, Precondition, QueryOptions,
+    ReadConsistencyStrategy, Region,
 };
 use azure_data_cosmos::{
     AccountEndpoint, AccountReference, CosmosClient, FeedScope, Query, RoutingStrategy,
@@ -116,6 +117,34 @@ async fn build_client_for_region(
         AccountReference::with_authentication_key(endpoint, Secret::from(key.to_string()));
     let client = CosmosClient::builder()
         .build(account_ref, RoutingStrategy::ProximityTo(region))
+        .await?;
+    Ok(client)
+}
+
+/// Like [`build_client`] but disables the per-partition circuit breaker (PPCB)
+/// at the client level.
+///
+/// On a standard Session account (no `enable_per_partition_failover_behavior`
+/// server property, as provisioned for these tests) this leaves both PPCB and
+/// PPAF off. In that configuration the *only* reason the driver pre-resolves
+/// the target partition key range id is that the client may route over Gateway
+/// 2.0 — mirroring .NET's `ThinClientStoreModel::ShouldResolvePartitionKeyRange()
+/// => true`. This reproduces the residual condition where a stale multi-range
+/// composite session token would otherwise be sent on a single-partition
+/// request and rejected by the thin-client backend with HTTP 400.
+async fn build_client_ppcb_disabled(
+    endpoint: &str,
+    key: &str,
+) -> Result<CosmosClient, Box<dyn std::error::Error>> {
+    let endpoint: AccountEndpoint = normalize_gateway_v2_endpoint(endpoint).parse()?;
+    let account_ref =
+        AccountReference::with_authentication_key(endpoint, Secret::from(key.to_string()));
+    let failover_options = PartitionFailoverOptions::builder()
+        .with_circuit_breaker_enabled(false)
+        .build()?;
+    let client = CosmosClient::builder()
+        .with_partition_failover_options(failover_options)
+        .build(account_ref, RoutingStrategy::ProximityTo(Region::EAST_US))
         .await?;
     Ok(client)
 }
@@ -762,8 +791,104 @@ pub async fn gateway_v2_cross_partition_query_via_feed_range_full(
     Ok(())
 }
 
-// ----------------------------------------------------------------------------
-// Request-token coverage: PageSize / Match / ReadConsistencyStrategy
+/// Read-your-writes across multiple physical partitions on Gateway 2.0 with the
+/// per-partition circuit breaker (PPCB) disabled.
+///
+/// Regression guard for the composite-session-token 400. On the thin-client
+/// (RNTBD-over-HTTP/2) path the backend rejects a multi-range composite session
+/// token (`pk0:vec0,pk1:vec1`) on a request that targets a single partition with
+/// `400 "Session token specified is invalid."`. Direct-mode semantics require
+/// sending only the target partition's single-range segment.
+///
+/// The client is built with PPCB disabled (see [`build_client_ppcb_disabled`]),
+/// which on these Session accounts also leaves PPAF off. In that configuration
+/// the driver must *still* resolve the target partition key range id purely
+/// because it may route over Gateway 2.0 — the exact residual gap this test
+/// pins. The load-bearing steps:
+///   1. Write 16 items across 16 distinct logical partition keys, so session
+///      tokens for multiple physical partition ranges accumulate in the cache.
+///   2. Point-read every item (read-your-writes). Each read targets one
+///      partition; before the fix, the accumulated multi-range composite token
+///      would be sent and rejected with 400. After the fix the token is scoped
+///      to the read's own range, so every read returns the just-written item.
+///   3. Run a `FeedRange::full()` cross-partition query and assert the complete
+///      result set, exercising the per-leaf scoped-token path as well.
+#[tokio::test]
+#[cfg_attr(
+    not(any(
+        test_category = "gateway_v2",
+        test_category = "gateway_v2_multi_region"
+    )),
+    ignore = "requires test_category 'gateway_v2' and AZURE_COSMOS_GW_V2_ENDPOINT/_KEY"
+)]
+pub async fn gateway_v2_session_read_your_writes_ppcb_disabled(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use azure_data_cosmos::feed::FeedRange;
+    use std::collections::HashSet;
+
+    let Some((endpoint, key)) = live_credentials() else {
+        return Ok(());
+    };
+
+    let client = build_client_ppcb_disabled(&endpoint, &key).await?;
+    let (db_name, container) = provision_database_and_multi_partition_container(&client).await?;
+
+    let total_items: usize = 16;
+    let mut written: Vec<(String, String)> = Vec::with_capacity(total_items);
+    let mut expected_ids: HashSet<String> = HashSet::new();
+    for i in 0..total_items {
+        let pk = format!("pk-{i:02}-{}", azure_core::Uuid::new_v4());
+        let id = format!("ryw-item-{i:02}");
+        let item = GwV2TestItem {
+            id: id.clone(),
+            pk: pk.clone(),
+            value: i as i64,
+            label: format!("row-{i}"),
+        };
+        let create_resp = container.create_item(&pk, &id, &item, None).await?;
+        assert_transport_kind(&create_resp.diagnostics(), TransportKind::GatewayV2);
+        written.push((pk, id.clone()));
+        expected_ids.insert(id);
+    }
+
+    // Read-your-writes: each point read targets a single partition. With
+    // multiple ranges cached, a composite session token would be rejected with
+    // 400; the scoped single-range token must instead return the written item.
+    for (i, (pk, id)) in written.iter().enumerate() {
+        let read_resp = container.read_item(pk, id, None).await?;
+        assert_transport_kind(&read_resp.diagnostics(), TransportKind::GatewayV2);
+        let read_item: GwV2TestItem = read_resp.into_model()?;
+        assert_eq!(
+            read_item.id, *id,
+            "read-your-writes must return the item just written to partition {i}",
+        );
+        assert_eq!(read_item.value, i as i64);
+    }
+
+    // Cross-partition query over the accumulated multi-range session state must
+    // also succeed and return the complete set (per-leaf scoped tokens).
+    let query = Query::from("SELECT * FROM c");
+    let mut pages = container
+        .query_items::<GwV2TestItem>(query, FeedScope::range(FeedRange::full()), None)
+        .await?
+        .into_pages();
+
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    while let Some(page) = pages.next().await {
+        let page = page?;
+        assert_transport_kind(&page.diagnostics(), TransportKind::GatewayV2);
+        for item in page.items() {
+            seen_ids.insert(item.id.clone());
+        }
+    }
+    assert_eq!(
+        seen_ids, expected_ids,
+        "cross-partition query with PPCB disabled must return every written item",
+    );
+
+    drop_database(&client, &db_name).await;
+    Ok(())
+}
 // ----------------------------------------------------------------------------
 //
 // The three tests below close a live-coverage gap: the Gateway 2.0 wrap path

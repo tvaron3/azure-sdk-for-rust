@@ -1784,7 +1784,8 @@ impl CosmosDriver {
     ///    partition.
     ///
     /// Returns `None` if:
-    /// - PPAF/PPCB is not enabled
+    /// - PPAF/PPCB is disabled **and** the client cannot route over Gateway 2.0
+    ///   (an authoritative stamped range id on the overrides is still honored)
     /// - The operation does not target a partitioned resource
     /// - No container reference or routing target is available
     /// - The cache lookup or fetch fails
@@ -1801,23 +1802,42 @@ impl CosmosDriver {
             return None;
         }
 
-        // A pre-resolved partition key range ID is only useful for
-        // PPAF/PPCB. Skip the work when neither mechanism is enabled.
-        let snapshot = self.location_state_store.snapshot();
-        let partition_state = snapshot.partitions.as_ref();
-        if !partition_state.per_partition_automatic_failover_enabled
-            && !partition_state.per_partition_circuit_breaker_enabled
-        {
-            return None;
-        }
-
         // The dataflow pipeline resolves each query into per-partition
         // sub-operations and stamps the owning physical partition's range ID
         // onto the overrides. When present it is authoritative — use it as-is,
         // skipping any cache lookup (and the multi-range collapse that would
         // otherwise silently drop the seed).
+        //
+        // This is checked BEFORE the PPAF/PPCB gate below: the resolved range
+        // ID is also required to scope the outgoing session token to a single
+        // partition. The thin-client/RNTBD backend rejects a multi-range
+        // composite session token on a partition-scoped request ("Session token
+        // specified is invalid."), so a stamped range id must always be honored
+        // even when PPAF/PPCB are both disabled.
         if let Some(pk_range_id) = overrides.partition_key_range_id.as_deref() {
             return Some(PartitionKeyRangeId::from(pk_range_id.to_owned()));
+        }
+
+        // A cache-resolved partition key range ID (below) scopes the outgoing
+        // session token to a single partition and feeds PPAF/PPCB routing.
+        // Resolve it whenever any consumer needs it:
+        //   * PPAF or PPCB is enabled (for failure attribution / routing), OR
+        //   * the client may route over Gateway 2.0 (thin-client), whose
+        //     backend rejects a multi-range composite session token on a
+        //     partition-scoped request ("Session token specified is invalid.").
+        //
+        // The Gateway 2.0 clause mirrors .NET's
+        // `ThinClientStoreModel::ShouldResolvePartitionKeyRange() => true`:
+        // thin-client-capable clients resolve the range unconditionally, while
+        // pure classic-gateway clients keep the PPAF/PPCB-gated behavior. When
+        // none of these apply, skip the cache work.
+        let snapshot = self.location_state_store.snapshot();
+        let partition_state = snapshot.partitions.as_ref();
+        if !partition_state.per_partition_automatic_failover_enabled
+            && !partition_state.per_partition_circuit_breaker_enabled
+            && !self.location_state_store.gateway_v2_enabled()
+        {
+            return None;
         }
 
         // Need a container reference for any cache-backed resolution below.

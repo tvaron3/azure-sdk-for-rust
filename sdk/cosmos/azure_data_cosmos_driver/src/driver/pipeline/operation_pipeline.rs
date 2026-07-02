@@ -503,9 +503,25 @@ pub(crate) async fn execute_operation_pipeline(
             },
             resolved_session_token: session_consistency_active
                 .then(|| {
+                    // Scope the session token to the target partition-key-range
+                    // only for thin-client (Gateway 2.0) requests: the RNTBD
+                    // backend rejects a composite multi-range token on a
+                    // single-partition request. Classic gateway accepts the
+                    // composite (and maps parent->child across splits), so keep
+                    // sending it there to stay read-your-writes safe.
+                    let scoped_pk_range_id =
+                        if matches!(routing.transport_mode, TransportMode::GatewayV2) {
+                            retry_state
+                                .partition_key_range_id
+                                .as_ref()
+                                .map(|id| id.as_str())
+                        } else {
+                            None
+                        };
                     session_manager.resolve_session_token(
                         operation,
                         operation.request_headers().session_token.as_ref(),
+                        scoped_pk_range_id,
                     )
                 })
                 .flatten(),
@@ -2367,12 +2383,20 @@ async fn perform_single_attempt(
     diagnostics: &mut DiagnosticsContextBuilder,
 ) -> crate::error::Result<TransportResult> {
     // Resolve session token using the same precedence the main loop uses.
+    // Scope to the target range only for thin-client (Gateway 2.0); classic
+    // gateway keeps the composite token (see main-loop rationale).
     let resolved_session_token = ctx
         .session_consistency_active
         .then(|| {
+            let scoped_pk_range_id = if matches!(routing.transport_mode, TransportMode::GatewayV2) {
+                ctx.partition_key_range_id.as_ref().map(|id| id.as_str())
+            } else {
+                None
+            };
             ctx.session_manager.resolve_session_token(
                 ctx.operation,
                 ctx.operation.request_headers().session_token.as_ref(),
+                scoped_pk_range_id,
             )
         })
         .flatten();
