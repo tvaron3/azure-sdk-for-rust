@@ -15,11 +15,13 @@
 ### Bugs Fixed
 
 - Increased `DEFAULT_PARTITION_EXPIRATION_DURATION` from 10 seconds to 60 seconds. The previous default was shorter than `DEFAULT_UPDATE_INTERVAL` (30 seconds), so ownership records expired between load-balancing cycles. The load balancer perpetually saw `current=0` for every consumer and continuously re-claimed partitions, causing widespread duplicate event processing. `EventProcessorBuilder::build` now rejects configurations where `partition_expiration_duration <= update_interval`. ([#3851](https://github.com/Azure/azure-sdk-for-rust/issues/3851))
+- A partition stolen by a higher-or-equal-epoch attacher now surfaces as `ErrorKind::ConsumerDisconnected` when the broker reports `amqp:link:stolen` on a re-attach, not only on an in-flight receive. Other attach failures inside the receive loop now classify by their own kind. The wrapper reported all of them as a message error, which the retry decider treated as non-retryable.
 - The `EventProcessor`'s load-balancer reconciliation now closes the underlying AMQP receiver for any partition that has been reassigned to another consumer, so the consumer's `stream_events()` resolves and the loop can terminate. Previously a stolen partition's client could continue to attempt receives until the broker tore down the link.
 
 ### Other Changes
 
 - Reduced lock contention when a single `ProducerClient` or `ConsumerClient` is shared across threads. The per-path sender, session, and receiver caches no longer serialize on a connection-wide lock: each partition's link attach runs without holding the shared lock, so the partitions on a shared client set up and recover concurrently instead of one at a time, and steady-state sends no longer queue behind an unrelated partition's attach.
+- Added `tracing` span instrumentation and structured-field logging across the connection, producer, consumer, event-processor, and checkpoint paths. Lifecycle events (connection open/close, reconnect outcome, link attach, partition ownership claim/revoke) and failure conditions (receive errors, link-stolen, send/batch rejections, unauthorized fast-fail, token-refresh failures) are now visible at the default `info`/`warn` levels, with diagnostic values attached as structured fields (`partition_id`, `connection_id`, `source_url`, and similar) following a documented level policy. Per-message hot paths stay at `trace`. Credentials are never logged, and event payloads are redacted by `SafeDebug` unless the `azure_core` `debug` feature is enabled. See the README for details and a subscriber example. ([#4592](https://github.com/Azure/azure-sdk-for-rust/issues/4592))
 
 ## 0.14.0 (Unreleased)
 

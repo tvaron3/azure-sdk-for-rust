@@ -63,13 +63,31 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub no_creates: bool,
 
+    /// Disable the per-feed-range change feed operation.
+    #[arg(long, default_value_t = false)]
+    pub no_change_feed: bool,
+
+    /// Maximum number of pages consumed by each change feed operation.
+    ///
+    /// Change feed streams are infinite, so every operation must stop after
+    /// a bounded number of page polls.
+    #[arg(long, default_value_t = 4)]
+    pub change_feed_max_pages: usize,
+
     /// Disable the per-feed-range query operation.
     ///
     /// When enabled (the default), the harness fans out
-    /// `SELECT VALUE COUNT(1) FROM c` across the container's physical
-    /// partitions, round-robin one range per call.
+    /// `SELECT * FROM c` across the container's physical partitions,
+    /// round-robin one range per call.
     #[arg(long, default_value_t = false)]
     pub no_feed_range_queries: bool,
+
+    /// Maximum number of pages consumed by each per-feed-range query.
+    ///
+    /// Bounds the work performed by one query as the container grows while
+    /// still exercising continuation-token handling across multiple pages.
+    #[arg(long, default_value_t = 4)]
+    pub feed_range_query_max_pages: usize,
 
     /// Interval in seconds between background refreshes of the cached feed
     /// range list. Set to 0 to disable the background refresher (the cache
@@ -86,15 +104,16 @@ pub struct Config {
     /// Drives the default closed-loop mode: the harness spawns this many
     /// persistent worker tasks, each serially issuing one operation at a
     /// time (so this is also the maximum number of in-flight requests).
-    /// Ignored when `--target-rate` is set, which switches to open-loop
-    /// (fixed arrival rate) issuance instead.
+    /// When `--target-rate` switches the benchmark to open-loop issuance,
+    /// this value still controls initial seeding concurrency but does not
+    /// control the benchmark worker count.
     #[arg(long, default_value_t = 50)]
     pub concurrency: usize,
 
     /// Target arrival rate in operations per second (open-loop mode).
     ///
     /// When set, requests are issued at this fixed rate regardless of how
-    /// fast prior requests complete, eliminating the coordinated-omission
+    /// fast prior requests complete, reducing the coordinated-omission
     /// bias of the closed-loop `--concurrency` model. In-flight requests
     /// are bounded by `--max-in-flight`; once that bound is hit, excess
     /// issuances are skipped and counted (not buffered) so a slow backend
@@ -122,6 +141,13 @@ pub struct Config {
     /// Stats reporting interval in seconds.
     #[arg(long, default_value_t = 300)]
     pub report_interval: u64,
+
+    /// Emit sampled summary diagnostics for operations slower than this threshold in milliseconds.
+    ///
+    /// Failures are also eligible for emission. Output is rate-limited by the
+    /// SDK's `SamplingLogHandler`. Omit to disable diagnostics logging.
+    #[arg(long)]
+    pub diagnostics_threshold_ms: Option<u64>,
 
     /// Throughput (RU/s) to provision when creating the container.
     #[arg(long, default_value_t = 100000)]

@@ -5,7 +5,7 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use azure_core::http::StatusCode;
+use azure_core::http::{Etag, StatusCode};
 use futures::future::BoxFuture;
 
 use super::{
@@ -114,6 +114,7 @@ pub(crate) struct MockRequestExecutor {
     pub responses: VecDeque<crate::error::Result<CosmosResponse>>,
     pub refresh_calls: Vec<PartitionRoutingRefresh>,
     pub continuation_calls: Vec<Option<String>>,
+    pub target_calls: Vec<RequestTarget>,
 }
 
 impl MockRequestExecutor {
@@ -122,6 +123,7 @@ impl MockRequestExecutor {
             responses: responses.into(),
             refresh_calls: Vec::new(),
             continuation_calls: Vec::new(),
+            target_calls: Vec::new(),
         }
     }
 }
@@ -130,12 +132,13 @@ impl RequestExecutor for MockRequestExecutor {
     fn execute_request<'a>(
         &'a mut self,
         _operation: &'a CosmosOperation,
-        _target: RequestTarget,
+        target: RequestTarget,
         partition_routing_refresh: PartitionRoutingRefresh,
         continuation: Option<String>,
     ) -> BoxFuture<'a, crate::error::Result<CosmosResponse>> {
         self.refresh_calls.push(partition_routing_refresh);
         self.continuation_calls.push(continuation);
+        self.target_calls.push(target);
         let response = self.responses.pop_front().expect("mock request response");
         Box::pin(async move { response })
     }
@@ -252,6 +255,25 @@ pub(crate) fn response_with_continuation(
     diagnostics.set_operation_status(StatusCode::Ok, None);
     let mut headers = CosmosResponseHeaders::new();
     headers.continuation = continuation.map(str::to_owned);
+    CosmosResponse::new(
+        body.to_vec(),
+        headers,
+        CosmosStatus::new(StatusCode::Ok),
+        Arc::new(diagnostics.complete()),
+    )
+}
+
+/// Creates a test response with the given body and an `ETag`, mirroring the
+/// change feed contract where every poll (including a start-from-`Now` 304)
+/// carries an ETag continuation.
+pub(crate) fn response_with_etag(body: &[u8], etag: &str) -> CosmosResponse {
+    let mut diagnostics = DiagnosticsContextBuilder::new(
+        ActivityId::new_uuid(),
+        Arc::new(DiagnosticsOptions::default()),
+    );
+    diagnostics.set_operation_status(StatusCode::Ok, None);
+    let mut headers = CosmosResponseHeaders::new();
+    headers.etag = Some(Etag::from(etag.to_owned()));
     CosmosResponse::new(
         body.to_vec(),
         headers,
