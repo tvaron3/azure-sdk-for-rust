@@ -80,7 +80,12 @@ fn generate_c_header() {
          #define COSMOS_VALUE_KIND_I64    1\n\
          #define COSMOS_VALUE_KIND_F64    2\n\
          #define COSMOS_VALUE_KIND_BOOL   3\n\
-         #define COSMOS_VALUE_KIND_U64    4",
+         #define COSMOS_VALUE_KIND_U64    4\n\
+         \n\
+         // Discriminants for cosmos_operation_options_t.query_plan_mode.\n\
+         #define COSMOS_QUERY_PLAN_MODE_UNSET           0\n\
+         #define COSMOS_QUERY_PLAN_MODE_LOCAL_PREFERRED 1\n\
+         #define COSMOS_QUERY_PLAN_MODE_GATEWAY_ONLY    2",
         env!("CARGO_PKG_VERSION")
     );
 
@@ -101,6 +106,8 @@ fn generate_c_header() {
         ("DriverHandle".into(), "driver_t".into()),
         ("AccountReference".into(), "account_ref_t".into()),
         ("AccountRefHandle".into(), "account_ref_t".into()),
+        ("CosmosTokenRequest".into(), "token_request_t".into()),
+        ("CosmosTokenProvider".into(), "token_provider_t".into()),
         ("DatabaseReference".into(), "database_ref_t".into()),
         ("DatabaseRefHandle".into(), "database_ref_t".into()),
         ("ContainerReference".into(), "container_ref_t".into()),
@@ -164,11 +171,16 @@ fn generate_c_header() {
             "CosmosOperationRequest".into(),
             "operation_request_t".into(),
         ),
+        (
+            "CosmosOperationRequestV2".into(),
+            "operation_request_v2_t".into(),
+        ),
         ("CosmosRuntimeOptions".into(), "runtime_options_t".into()),
         (
             "CosmosDriverOptionsConfig".into(),
             "driver_options_config_t".into(),
         ),
+        ("CosmosQueryPlanMode".into(), "query_plan_mode_t".into()),
         // Enums / option structs. Variant prefixes are baked into
         // the Rust variant names (e.g. `CompletionQueueStateRunning`,
         // `CompletionOutcomeOk`) so the `ScreamingSnakeCase` enum rule
@@ -195,6 +207,7 @@ fn generate_c_header() {
             "CosmosContentResponseOnWrite".into(),
             "content_response_on_write_t".into(),
         ),
+        ("CosmosPatchStrategy".into(), "patch_strategy_t".into()),
     ]);
 
     let config = cbindgen::Config {
@@ -247,6 +260,7 @@ fn generate_c_header() {
                 "CosmosPreconditionKind".into(),
                 "CosmosReadConsistencyStrategy".into(),
                 "CosmosContentResponseOnWriteOpt".into(),
+                "CosmosPatchStrategy".into(),
                 // Named mirror of the driver's synthetic sub-status codes. Not
                 // referenced by any exported struct field (hosts read the low 16
                 // bits of a packed cosmos_status_code_t), so force its emission.

@@ -13,7 +13,8 @@ use crate::{
     models::ThroughputControlGroupName,
     options::{
         AvailabilityStrategy, BinaryEncodingOptions, ContentResponseOnWrite,
-        EndToEndOperationLatencyPolicy, ExcludedRegions, PriorityLevel, ReadConsistencyStrategy,
+        EndToEndOperationLatencyPolicy, ExcludedRegions, PatchStrategy, PriorityLevel,
+        QueryPlanMode, ReadConsistencyStrategy,
     },
 };
 
@@ -39,6 +40,26 @@ use crate::{
 #[options(layers(runtime, account, operation))]
 #[non_exhaustive]
 pub struct OperationOptions {
+    /// Query-plan provider selection for query operations.
+    ///
+    /// `None` inherits from a lower layer (default:
+    /// [`QueryPlanMode::LocalPreferred`]). The
+    /// `AZURE_COSMOS_QUERY_PLAN_MODE_OVERRIDE` environment variable takes
+    /// precedence over every programmatic layer as a livesite kill switch.
+    #[option(env = "AZURE_COSMOS_QUERY_PLAN_MODE", overridable)]
+    pub query_plan_mode: Option<QueryPlanMode>,
+
+    /// How PATCH operations are executed.
+    ///
+    /// `None` inherits from a lower layer (default: [`PatchStrategy::Auto`]).
+    /// `AZURE_COSMOS_PATCH_STRATEGY=ServerSide` therefore applies process-wide
+    /// unless a higher-priority runtime, account, or operation value overrides
+    /// it. Unsafe server-side PATCH does not persist a tracking marker and is
+    /// not retried after an ambiguous outcome; client-side-only settings are
+    /// ignored whenever the resolved strategy uses the server path.
+    #[option(env = "AZURE_COSMOS_PATCH_STRATEGY")]
+    pub patch_strategy: Option<PatchStrategy>,
+
     /// Read consistency strategy for this request.
     ///
     /// Controls the consistency guarantee for read operations. Set to `None` to
@@ -77,8 +98,10 @@ pub struct OperationOptions {
     /// Disables automatic session token management.
     ///
     /// When `None` or `Some(false)`, session tokens are captured from responses
-    /// and sent on subsequent requests for session consistency.
-    /// Set to `Some(true)` to disable this behavior.
+    /// and sent on subsequent requests for session consistency. Set to `Some(true)`
+    /// to disable both automatic capture and automatic resolution. User-provided
+    /// session tokens are unaffected. This setting cannot enable automatic session
+    /// token management when the driver's partition key range cache is disabled.
     pub session_capturing_disabled: Option<bool>,
 
     /// Maximum number of session-consistency retries on 404/1002 errors.
@@ -148,7 +171,7 @@ pub struct OperationOptions {
     /// Controls whether the operation uses binary on the wire and whether the
     /// driver transcodes the response back to text. Schema-agnostic, so it is
     /// honored uniformly for the Rust SDK and FFI callers. `None` inherits from
-    /// a lower level (default: text JSON, no binary). See
+    /// a lower level (default: binary encoding enabled). See
     /// [`BinaryEncodingOptions`].
     pub binary_encoding: Option<BinaryEncodingOptions>,
 }
@@ -279,6 +302,7 @@ mod tests {
     #[test]
     fn default_operation_options() {
         let options = OperationOptions::default();
+        assert!(options.patch_strategy.is_none());
         assert!(options.read_consistency_strategy.is_none());
         assert!(options.excluded_regions.is_none());
         assert!(options.content_response_on_write.is_none());
@@ -294,6 +318,7 @@ mod tests {
             .with_max_retry_wait_time(Duration::from_secs(12))
             .build();
         let options = OperationOptionsBuilder::new()
+            .with_patch_strategy(PatchStrategy::ClientSide)
             .with_content_response_on_write(ContentResponseOnWrite::Disabled)
             .with_read_consistency_strategy(ReadConsistencyStrategy::Session)
             .with_max_failover_retry_count(5)
@@ -301,6 +326,7 @@ mod tests {
             .with_throttling_retry_options(throttling)
             .build();
 
+        assert_eq!(options.patch_strategy, Some(PatchStrategy::ClientSide));
         assert_eq!(
             options.content_response_on_write,
             Some(ContentResponseOnWrite::Disabled)
@@ -326,6 +352,7 @@ mod tests {
         use std::sync::Arc;
 
         let env = Arc::new(OperationOptions {
+            patch_strategy: Some(PatchStrategy::ServerSide),
             read_consistency_strategy: Some(ReadConsistencyStrategy::Eventual),
             max_failover_retry_count: Some(3),
             ..Default::default()
@@ -343,6 +370,7 @@ mod tests {
         });
 
         let operation = OperationOptions {
+            patch_strategy: Some(PatchStrategy::ClientSide),
             read_consistency_strategy: Some(ReadConsistencyStrategy::Session),
             ..Default::default()
         };
@@ -350,6 +378,8 @@ mod tests {
         let view =
             OperationOptionsView::new(Some(env), Some(runtime), Some(account), Some(&operation));
 
+        // Operation overrides env
+        assert_eq!(view.patch_strategy(), Some(&PatchStrategy::ClientSide));
         // Operation overrides env
         assert_eq!(
             view.read_consistency_strategy(),
@@ -396,6 +426,7 @@ mod tests {
     #[test]
     fn from_env_vars_parses_known_vars() {
         let options = OperationOptions::from_env_vars(|key| match key {
+            "AZURE_COSMOS_PATCH_STRATEGY" => Ok("ServerSide".to_string()),
             "AZURE_COSMOS_READ_CONSISTENCY_STRATEGY" => Ok("Session".to_string()),
             "AZURE_COSMOS_CONTENT_RESPONSE_ON_WRITE" => Ok("true".to_string()),
             "AZURE_COSMOS_MAX_FAILOVER_RETRY_COUNT" => Ok("7".to_string()),
@@ -404,6 +435,7 @@ mod tests {
             _ => Err(std::env::VarError::NotPresent),
         });
 
+        assert_eq!(options.patch_strategy, Some(PatchStrategy::ServerSide));
         assert_eq!(
             options.read_consistency_strategy,
             Some(ReadConsistencyStrategy::Session)
@@ -440,6 +472,7 @@ mod tests {
     fn from_env_vars_returns_none_for_missing_vars() {
         let options = OperationOptions::from_env_vars(|_| Err(std::env::VarError::NotPresent));
 
+        assert!(options.patch_strategy.is_none());
         assert!(options.read_consistency_strategy.is_none());
         assert!(options.content_response_on_write.is_none());
         assert!(options.excluded_regions.is_none());
@@ -692,6 +725,94 @@ mod tests {
         assert_eq!(view.hedging_enabled(), Some(&true));
     }
 
+    #[test]
+    fn query_plan_mode_resolves_across_all_layers() {
+        let env = std::sync::Arc::new(OperationOptions {
+            query_plan_mode: Some(QueryPlanMode::LocalPreferred),
+            ..Default::default()
+        });
+        let runtime = std::sync::Arc::new(OperationOptions {
+            query_plan_mode: Some(QueryPlanMode::GatewayOnly),
+            ..Default::default()
+        });
+        let account = std::sync::Arc::new(OperationOptions {
+            query_plan_mode: Some(QueryPlanMode::LocalPreferred),
+            ..Default::default()
+        });
+        let operation = OperationOptions {
+            query_plan_mode: Some(QueryPlanMode::GatewayOnly),
+            ..Default::default()
+        };
+
+        let view =
+            OperationOptionsView::new(Some(env), Some(runtime), Some(account), Some(&operation));
+
+        assert_eq!(view.query_plan_mode(), Some(&QueryPlanMode::GatewayOnly));
+    }
+
+    #[test]
+    fn query_plan_mode_environment_override_is_authoritative() {
+        let env_override = std::sync::Arc::new(OperationOptions {
+            query_plan_mode: Some(QueryPlanMode::GatewayOnly),
+            ..Default::default()
+        });
+        let operation = OperationOptions {
+            query_plan_mode: Some(QueryPlanMode::LocalPreferred),
+            ..Default::default()
+        };
+
+        let view = OperationOptionsView::new_with_override(
+            Some(env_override),
+            None,
+            None,
+            None,
+            Some(&operation),
+        );
+
+        assert_eq!(view.query_plan_mode(), Some(&QueryPlanMode::GatewayOnly));
+    }
+
+    #[test]
+    fn query_plan_mode_environment_variables_are_parsed() {
+        let base = OperationOptions::from_env_vars(|key| match key {
+            "AZURE_COSMOS_QUERY_PLAN_MODE" => Ok("LocalPreferred".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+        let override_options = OperationOptions::from_env_override_vars(|key| match key {
+            "AZURE_COSMOS_QUERY_PLAN_MODE_OVERRIDE" => Ok("gateway".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+
+        assert_eq!(base.query_plan_mode, Some(QueryPlanMode::LocalPreferred));
+        assert_eq!(
+            override_options.query_plan_mode,
+            Some(QueryPlanMode::GatewayOnly)
+        );
+    }
+
+    #[test]
+    fn invalid_query_plan_mode_override_falls_through() {
+        let env_override =
+            std::sync::Arc::new(OperationOptions::from_env_override_vars(|key| match key {
+                "AZURE_COSMOS_QUERY_PLAN_MODE_OVERRIDE" => Ok("invalid".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            }));
+        let operation = OperationOptions {
+            query_plan_mode: Some(QueryPlanMode::GatewayOnly),
+            ..Default::default()
+        };
+
+        let view = OperationOptionsView::new_with_override(
+            Some(env_override),
+            None,
+            None,
+            None,
+            Some(&operation),
+        );
+
+        assert_eq!(view.query_plan_mode(), Some(&QueryPlanMode::GatewayOnly));
+    }
+
     /// `from_env_override_vars` populates only the `overridable` fields from
     /// their `{ENV}_OVERRIDE` variants and leaves every other env field
     /// `None` (the base `from_env_vars` path is unaffected).
@@ -799,6 +920,7 @@ mod real_env_tests {
         // With no variables set, the env layer contributes nothing.
         with_scoped_env(OPERATION_ENV_VARS, &[], || {
             let o = OperationOptions::from_env();
+            assert!(o.patch_strategy.is_none());
             assert!(o.read_consistency_strategy.is_none());
             assert!(o.content_response_on_write.is_none());
             assert!(o.max_failover_retry_count.is_none());
@@ -809,13 +931,17 @@ mod real_env_tests {
 
     #[test]
     fn real_env_value_flows_through() {
-        // A real `AZURE_COSMOS_READ_CONSISTENCY_STRATEGY` flows through
-        // `from_env`, proving the production accessor is connected.
+        // Real strategy and consistency values flow through `from_env`,
+        // proving the production accessor is connected.
         with_scoped_env(
             OPERATION_ENV_VARS,
-            &[("AZURE_COSMOS_READ_CONSISTENCY_STRATEGY", "Session")],
+            &[
+                ("AZURE_COSMOS_PATCH_STRATEGY", "ClientSide"),
+                ("AZURE_COSMOS_READ_CONSISTENCY_STRATEGY", "Session"),
+            ],
             || {
                 let o = OperationOptions::from_env();
+                assert_eq!(o.patch_strategy, Some(PatchStrategy::ClientSide));
                 assert_eq!(
                     o.read_consistency_strategy,
                     Some(ReadConsistencyStrategy::Session)

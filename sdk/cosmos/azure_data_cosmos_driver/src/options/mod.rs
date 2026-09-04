@@ -26,9 +26,11 @@ mod hedging;
 mod identity;
 mod operation_options;
 mod partition_failover;
+mod patch_strategy;
 mod plan_options;
 mod policies;
 mod priority;
+mod query_plan_mode;
 mod read_consistency;
 mod region;
 mod throughput_control;
@@ -53,12 +55,14 @@ pub use operation_options::{
     ThroughputControlOptionsBuilder, ThroughputControlOptionsView,
 };
 pub use partition_failover::{PartitionFailoverOptions, PartitionFailoverOptionsBuilder};
+pub use patch_strategy::PatchStrategy;
 pub use plan_options::{PlanOptions, DEFAULT_MAX_FAN_OUT};
 pub use policies::{
     ContentResponseOnWrite, EndToEndOperationLatencyPolicy, ExcludedRegions,
     ServerCertificateValidation, TlsBackend,
 };
 pub use priority::PriorityLevel;
+pub use query_plan_mode::QueryPlanMode;
 pub(crate) use read_consistency::resolve_effective_consistency;
 pub use read_consistency::ReadConsistencyStrategy;
 pub use region::Region;

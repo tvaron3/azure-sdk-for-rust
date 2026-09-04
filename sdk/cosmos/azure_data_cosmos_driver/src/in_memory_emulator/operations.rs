@@ -5,7 +5,6 @@
 
 // cspell:ignore acked hexdigit llsn
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,7 +24,7 @@ use super::response::headers::{
 #[cfg(feature = "preview_dtx")]
 use super::response::headers::{ETAG, REQUEST_CHARGE, SESSION_TOKEN, SUBSTATUS};
 use super::response::{
-    error_response, success_response, success_response_with_format, ResponseBuilder,
+    error_response, success_response, success_response_with_format, ResponseBuilder, ResponseFormat,
 };
 use super::ru_model::RuChargingModel;
 use super::session::SessionToken;
@@ -37,18 +36,16 @@ use super::system_properties::{
     account_properties_to_json, container_to_json, database_to_json, feed_to_json,
     inject_system_properties, offer_to_json, pkranges_to_json,
 };
-#[cfg(feature = "preview_dtx")]
 use crate::driver::pipeline::patch_eval::apply_patch_ops;
-#[cfg(feature = "preview_dtx")]
 use crate::models::PatchInstructions;
-use crate::models::{
-    EffectivePartitionKey, PartitionKeyDefinition, PartitionKeyValue as ModelPartitionKeyValue,
-};
+use crate::models::{PartitionKeyDefinition, MAX_SERVER_SIDE_PATCH_OPERATIONS};
 use crate::query::ast::{
     SqlCollection, SqlCollectionExpression, SqlQuery, SqlScalarExpression, SqlSelectSpec,
 };
 
 static OFFER_REPLACE_PENDING: HeaderName = HeaderName::from_static("x-ms-offer-replace-pending");
+static INTENDED_COLLECTION_RID: HeaderName =
+    HeaderName::from_static("x-ms-cosmos-intended-collection-rid");
 
 #[cfg(feature = "preview_dtx")]
 static DTX_IDEMPOTENCY_TOKEN: HeaderName =
@@ -142,10 +139,16 @@ pub(crate) async fn handle_operation(
     store: &Arc<EmulatorStore>,
     region_name: &str,
     parsed: &ParsedRequest,
-    _request_headers: &Headers,
+    request_headers: &Headers,
     request_body: &[u8],
 ) -> AsyncRawResponse {
     let start = Instant::now();
+    if let Some(response) =
+        intended_collection_rid_mismatch(store, region_name, parsed, request_headers, start)
+    {
+        return finalize_response(store, response, parsed.activity_id.as_deref()).await;
+    }
+
     let response = match &parsed.operation {
         OperationType::ReadAccount => handle_read_account(store, parsed, start),
         OperationType::CreateDatabase => {
@@ -232,6 +235,12 @@ pub(crate) async fn handle_operation(
             }
             handle_replace(store, region_name, parsed, request_body, start).await
         }
+        OperationType::Patch => {
+            if !store.config().is_write_region(region_name) {
+                return write_forbidden_response(start);
+            }
+            handle_patch(store, region_name, parsed, request_body, start).await
+        }
         OperationType::Upsert => {
             if !store.config().is_write_region(region_name) {
                 return write_forbidden_response(start);
@@ -275,14 +284,8 @@ pub(crate) async fn handle_operation(
         }
         #[cfg(feature = "preview_dtx")]
         OperationType::DistributedTransaction => {
-            handle_distributed_transaction(
-                store,
-                region_name,
-                _request_headers,
-                request_body,
-                start,
-            )
-            .await
+            handle_distributed_transaction(store, region_name, request_headers, request_body, start)
+                .await
         }
         OperationType::BadRequestPath(desc) => bad_request_path_response(desc, start),
         OperationType::InvalidInput(desc) => invalid_input_response(desc, start),
@@ -655,6 +658,7 @@ pub(crate) async fn handle_operation(
             if_none_match: operation.if_none_match.clone(),
             if_modified_since: None,
             session_token: operation.session_token.clone(),
+            read_consistency_strategy: None,
             activity_id: None,
             content_response_on_write: true,
             offer_throughput: None,
@@ -906,7 +910,16 @@ pub(crate) async fn handle_operation(
         match result {
             Some(Ok((doc, token, charge, headers))) => {
                 store.replicate(region_name, db_id, coll_id, &doc, false);
-                let builder = success_response(StatusCode::Ok, &doc.body, charge, &token, start);
+                // A stored document, so it is normalized the way the service
+                // renders one in text. Text-only: DTX has no binary format.
+                let builder = success_response_with_format(
+                    StatusCode::Ok,
+                    &doc.body,
+                    false,
+                    charge,
+                    &token,
+                    start,
+                );
                 decorate_point_response(builder, headers, Some(doc.lsn)).build()
             }
             Some(Err(response)) => response,
@@ -981,6 +994,8 @@ pub(crate) async fn handle_operation(
     ) -> AsyncRawResponse {
         let write_lock = store.document_write_lock();
         let _write_guard = write_lock.lock().await;
+        let replication_barrier = store.replication_barrier();
+        let _replication_guard = replication_barrier.read().await;
         handle_dtx_write_transaction_locked(store, region_name, operations, start).await
     }
 
@@ -1463,6 +1478,7 @@ pub(crate) async fn handle_operation(
             if_none_match: operation.if_none_match.clone(),
             if_modified_since: None,
             session_token: operation.session_token.clone(),
+            read_consistency_strategy: None,
             activity_id: None,
             content_response_on_write: true,
             offer_throughput: None,
@@ -1672,6 +1688,61 @@ pub(crate) async fn handle_operation(
             .without_header(RESOURCE_USAGE.clone())
     }
     finalize_response(store, response, parsed.activity_id.as_deref()).await
+}
+
+fn intended_collection_rid_mismatch(
+    store: &EmulatorStore,
+    region_name: &str,
+    parsed: &ParsedRequest,
+    request_headers: &Headers,
+    start: Instant,
+) -> Option<AsyncRawResponse> {
+    let intended_rid = request_headers.get_optional_str(&INTENDED_COLLECTION_RID)?;
+    let targets_container_data = match parsed.operation {
+        OperationType::ReadPKRanges
+        | OperationType::ReadFeedItems
+        | OperationType::Create
+        | OperationType::Read
+        | OperationType::Replace
+        | OperationType::Upsert
+        | OperationType::Delete
+        | OperationType::QueryItems
+        | OperationType::QueryPlan
+        | OperationType::Batch
+        | OperationType::DeleteContainer
+        | OperationType::ReadContainer
+        | OperationType::Unsupported(_) => true,
+        #[cfg(feature = "preview_dtx")]
+        OperationType::DistributedTransaction => true,
+        _ => false,
+    };
+    if !targets_container_data {
+        return None;
+    }
+
+    let db_id = parsed.db_id.as_deref()?;
+    let coll_id = parsed.coll_id.as_deref()?;
+    let current = store.region(region_name)?.get_container(db_id, coll_id)?;
+    if current.metadata.rid == intended_rid {
+        return None;
+    }
+
+    Some(
+        error_response(
+            StatusCode::BadRequest,
+            Some(
+                crate::models::SubStatusCode::COLLECTION_RID_MISMATCH
+                    .value()
+                    .into(),
+            ),
+            "BadRequest",
+            "The collection resource ID does not match the intended collection resource ID.",
+            0.0,
+            "",
+            start,
+        )
+        .build(),
+    )
 }
 
 // --- Control-Plane Operations ---
@@ -2335,6 +2406,7 @@ fn success_feed_response(
     items: Vec<serde_json::Value>,
     page_options: FeedPageOptions<'_>,
     feed_headers: FeedResponseHeaders,
+    format: ResponseFormat,
     start: Instant,
 ) -> AsyncRawResponse {
     let (page, next) = match paginate_values(
@@ -2348,9 +2420,10 @@ fn success_feed_response(
     };
     let item_count = page.len() as u32;
     let body = feed_to_json(envelope_name, page, rid);
-    let mut builder = success_response(
+    let mut builder = success_response_with_format(
         StatusCode::Ok,
         &body,
+        format.is_binary(),
         1.0,
         &feed_headers.session_token,
         start,
@@ -2377,6 +2450,7 @@ fn success_document_feed_response(
     items: Vec<DocumentFeedItem>,
     page_options: FeedPageOptions<'_>,
     feed_headers: FeedResponseHeaders,
+    format: ResponseFormat,
     start: Instant,
 ) -> AsyncRawResponse {
     let (page, next) = match paginate_document_feed_items(
@@ -2390,9 +2464,10 @@ fn success_document_feed_response(
     };
     let item_count = page.len() as u32;
     let body = feed_to_json(envelope_name, page, rid);
-    let mut builder = success_response(
+    let mut builder = success_response_with_format(
         StatusCode::Ok,
         &body,
+        format.is_binary(),
         1.0,
         &feed_headers.session_token,
         start,
@@ -2496,6 +2571,7 @@ fn execute_query_feed(
         results,
         FeedPageOptions::from_request(parsed),
         feed_headers,
+        ResponseFormat::from(parsed.binary_response),
         start,
     )
 }
@@ -2520,6 +2596,7 @@ fn execute_document_query_feed(
             results,
             FeedPageOptions::from_request(parsed),
             feed_headers,
+            ResponseFormat::from(parsed.binary_response),
             start,
         ),
         Ok(None) => {
@@ -2545,6 +2622,7 @@ fn execute_document_query_feed(
                 results,
                 FeedPageOptions::from_request(parsed),
                 feed_headers,
+                ResponseFormat::from(parsed.binary_response),
                 start,
             )
         }
@@ -2723,6 +2801,7 @@ fn handle_read_feed_databases(
         databases,
         FeedPageOptions::from_request(parsed),
         FeedResponseHeaders::none(),
+        ResponseFormat::Text,
         start,
     )
 }
@@ -2788,6 +2867,7 @@ fn handle_read_feed_containers(
         containers,
         FeedPageOptions::from_request(parsed),
         FeedResponseHeaders::none(),
+        ResponseFormat::Text,
         start,
     )
 }
@@ -2849,6 +2929,7 @@ fn handle_read_feed_offers(
         offers,
         FeedPageOptions::from_request(parsed),
         FeedResponseHeaders::none(),
+        ResponseFormat::Text,
         start,
     )
 }
@@ -3190,6 +3271,7 @@ fn handle_read_feed_items(
                 docs,
                 FeedPageOptions::from_request(parsed),
                 headers,
+                ResponseFormat::Text,
                 start,
             )
         }
@@ -3285,371 +3367,35 @@ fn handle_query_items(
     }
 }
 
-fn local_distinct_type_to_dataflow(
-    distinct_type: crate::query::plan::DistinctType,
-) -> crate::driver::dataflow::query_plan::DistinctType {
-    match distinct_type {
-        crate::query::plan::DistinctType::None => {
-            crate::driver::dataflow::query_plan::DistinctType::None
-        }
-        crate::query::plan::DistinctType::Ordered => {
-            crate::driver::dataflow::query_plan::DistinctType::Ordered
-        }
-        crate::query::plan::DistinctType::Unordered => {
-            crate::driver::dataflow::query_plan::DistinctType::Unordered
-        }
-    }
-}
-
-fn local_sort_order_to_dataflow(
-    sort_order: crate::query::plan::SortOrder,
-) -> crate::driver::dataflow::query_plan::SortOrder {
-    match sort_order {
-        crate::query::plan::SortOrder::Ascending => {
-            crate::driver::dataflow::query_plan::SortOrder::Ascending
-        }
-        crate::query::plan::SortOrder::Descending => {
-            crate::driver::dataflow::query_plan::SortOrder::Descending
-        }
-    }
-}
-
 fn local_query_info_to_dataflow(
     info: crate::query::plan::LocalQueryInfo,
     original_query: &str,
 ) -> crate::driver::dataflow::query_plan::QueryInfo {
-    // Compute the per-partition `rewrittenQuery` the real Gateway returns.
-    //
-    // - `ORDER BY` (with or without `OFFSET`/`LIMIT`): synthesize the order-by
-    //   envelope so each partition streams globally-ordered rows. The client's
-    //   `SkipTake` applies any `OFFSET`/`LIMIT`/`TOP` window *on top of* the
-    //   ordered merge, so the window is not pushed per-partition here.
-    // - `OFFSET`/`LIMIT` without ordering: each partition yields `offset +
-    //   limit` documents from the top (no per-partition skip); the client then
-    //   applies the single *global* skip/take. Without this rewrite a
-    //   cross-partition `OFFSET x LIMIT y` would skip `x` in every partition
-    //   *and* again in the client's `SkipTake`, dropping rows.
-    // - `TOP`-only (and everything else): no rewrite. A per-partition `TOP n`
-    //   combined with the client's global `TOP n` is already correct, so the
-    //   empty (no-op) rewritten query is kept.
-    let rewritten_query = if !info.order_by.is_empty() {
-        synthesize_order_by_rewritten_query(original_query, &info.order_by_expressions)
-    } else if let Some(limit) = info.limit {
-        synthesize_offset_limit_rewritten_query(
-            original_query,
-            info.offset.unwrap_or(0) as u64,
-            limit as u64,
-        )
-    } else {
-        Some(String::new())
-    };
-    crate::driver::dataflow::query_plan::QueryInfo {
-        distinct_type: local_distinct_type_to_dataflow(info.distinct_type),
-        top: info.top.map(|v| v as u64),
-        offset: info.offset.map(|v| v as u64),
-        limit: info.limit.map(|v| v as u64),
-        order_by: info
-            .order_by
-            .into_iter()
-            .map(local_sort_order_to_dataflow)
-            .collect(),
-        order_by_expressions: info.order_by_expressions,
-        group_by_expressions: info.group_by_expressions,
-        group_by_aliases: Vec::new(),
-        aggregates: info
-            .aggregates
-            .into_iter()
-            .map(|a| format!("{a:?}"))
-            .collect(),
-        group_by_alias_to_aggregate_type: HashMap::new(),
-        rewritten_query,
-        has_select_value: info.has_select_value,
-        has_non_streaming_order_by: false,
-    }
+    crate::query::local_plan_adapter::emulator_query_info_to_dataflow(info, original_query)
 }
 
-/// Synthesizes the per-partition `rewrittenQuery` the real Gateway returns for
-/// `OFFSET`/`LIMIT`: the original query with its trailing `OFFSET <x> LIMIT
-/// <y>` replaced by `OFFSET 0 LIMIT <x + y>`. Each partition then returns the
-/// first `x + y` documents (no per-partition skip) and the client applies the
-/// single global skip/take (see `driver::dataflow::SkipTake`).
-///
-/// The clause boundary is located by lexing rather than string-matching so a
-/// property path such as `c.offset` cannot be mistaken for the keyword. Returns
-/// `Some(String::new())` (no rewrite) if the query carries no `OFFSET` token,
-/// which shouldn't happen for a plan whose `LocalQueryInfo` reports a limit.
-///
-/// Only the *outer* trailing `OFFSET` clause is rewritten: the grammar places it
-/// after any `SELECT`/`WHERE`/`ORDER BY` at bracket depth zero, so a `SELECT`
-/// list containing a subquery with its own `OFFSET`/`LIMIT` (e.g.
-/// `SELECT (SELECT VALUE x FROM x OFFSET 1 LIMIT 2) ... OFFSET 5 LIMIT 10`) is
-/// left intact. We therefore track parenthesis / bracket / brace nesting and
-/// select the *last* `OFFSET` token seen at depth zero rather than the first
-/// token anywhere.
-///
-/// This rewrite is only used for cross-partition `OFFSET`/`LIMIT` *without*
-/// `ORDER BY`. When a query also has `ORDER BY`, `local_query_info_to_dataflow`
-/// synthesizes the order-by envelope instead and the client's `SkipTake`
-/// applies the `OFFSET`/`LIMIT` window on top of the ordered merge, so the two
-/// rewrites never combine into a single per-partition query.
+#[cfg(test)]
 fn synthesize_offset_limit_rewritten_query(
     original_query: &str,
     offset: u64,
     limit: u64,
 ) -> Option<String> {
-    use crate::query::lexer::{Lexer, TokenKind};
-
-    let tokens = Lexer::tokenize(original_query);
-    let mut depth: u32 = 0;
-    let mut outer_offset_idx: Option<usize> = None;
-    for (idx, token) in tokens.iter().enumerate() {
-        match token.kind {
-            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
-                depth = depth.saturating_sub(1);
-            }
-            TokenKind::Offset if depth == 0 => {
-                // Skip an `OFFSET` that is really a property access such as
-                // `c.offset`; the keyword only starts a clause when it is not
-                // immediately preceded by a member-access dot.
-                let is_property_access = idx > 0 && tokens[idx - 1].kind == TokenKind::Dot;
-                if !is_property_access {
-                    outer_offset_idx = Some(idx);
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some(offset_idx) = outer_offset_idx else {
-        return Some(String::new());
-    };
-    let prefix = original_query[..tokens[offset_idx].span.start].trim_end();
-    let combined = offset.saturating_add(limit);
-    Some(format!("{prefix} OFFSET 0 LIMIT {combined}"))
+    crate::query::local_plan_adapter::synthesize_offset_limit_rewritten_query(
+        original_query,
+        offset,
+        limit,
+    )
 }
 
-/// Synthesizes a single-level rewritten `ORDER BY` envelope query, mirroring
-/// what the real Gateway/native query-plan engine returns in
-/// `rewrittenQuery`:
-///
-/// ```text
-/// SELECT VALUE {"_rid": <alias>._rid, "orderByItems": [{"item": <expr0>}, ...], "payload": <alias>}
-/// <original FROM clause, sliced verbatim>
-/// WHERE [(<original predicate>) AND] {documentdb-formattableorderbyquery-filter}
-/// <original ORDER BY clause, sliced verbatim>
-/// ```
-///
-/// The placeholder is substituted in place by the client with `true`
-/// (fresh start) or a scalar `_rid`-aware resume filter (see
-/// `driver::dataflow::query_response`) — no outer subquery wrapper, so the
-/// result stays flat and directly evaluable.
-///
-/// Supports `SELECT *` and `SELECT VALUE <expression>`. Other projection
-/// shapes return `None` rather than synthesizing the wrong payload.
+#[cfg(test)]
 fn synthesize_order_by_rewritten_query(
     original_query: &str,
     order_by_expressions: &[String],
 ) -> Option<String> {
-    use crate::query::lexer::{Lexer, TokenKind};
-
-    // Kept in sync with `driver::dataflow::query_response`'s
-    // `ORDER_BY_FILTER_PLACEHOLDER` (this authors it; that substitutes it).
-    const ORDER_BY_FILTER_PLACEHOLDER: &str = "{documentdb-formattableorderbyquery-filter}";
-
-    let tokens = Lexer::tokenize(original_query);
-    let mut depth = 0_usize;
-    let mut top_level = Vec::new();
-    for (index, token) in tokens.iter().enumerate() {
-        if matches!(
-            token.kind,
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace
-        ) {
-            depth = depth.saturating_sub(1);
-        }
-        if depth == 0 {
-            top_level.push(index);
-        }
-        if matches!(
-            token.kind,
-            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
-        ) {
-            depth += 1;
-        }
-    }
-    let is_clause_keyword = |index: usize| index == 0 || tokens[index - 1].kind != TokenKind::Dot;
-    let select_idx = top_level
-        .iter()
-        .copied()
-        .find(|&i| tokens[i].kind == TokenKind::Select)?;
-    let from_idx = top_level
-        .iter()
-        .copied()
-        .find(|&i| tokens[i].kind == TokenKind::From && is_clause_keyword(i))?;
-    let collection_token = tokens.get(from_idx + 1)?;
-    let alias = match tokens.get(from_idx + 2) {
-        Some(t) if t.kind == TokenKind::As => tokens.get(from_idx + 3)?.text,
-        Some(t) if t.kind == TokenKind::Identifier => t.text,
-        _ => collection_token.text,
-    };
-    // Skip a leading `TOP <n>` / `TOP @param`: the global TOP is applied by the
-    // client's `SkipTake` over the merged stream, so the per-partition envelope
-    // must not carry it (a per-partition TOP would drop rows a later partition
-    // needs for the global ordering).
-    let mut payload_idx = select_idx + 1;
-    if tokens
-        .get(payload_idx)
-        .is_some_and(|t| t.kind == TokenKind::Top)
-    {
-        payload_idx += 2;
-    }
-    let payload = match tokens.get(payload_idx)? {
-        token if token.kind == TokenKind::Star => alias.to_owned(),
-        token if token.kind == TokenKind::Value => original_query
-            [token.span.end..tokens[from_idx].span.start]
-            .trim()
-            .to_owned(),
-        _ => return None,
-    };
-
-    let order_idx = top_level.iter().copied().find(|&i| {
-        tokens[i].kind == TokenKind::Order
-            && tokens
-                .get(i + 1)
-                .is_some_and(|token| token.kind == TokenKind::By)
-    });
-    let clause_end = order_idx
-        .map(|i| tokens[i].span.start)
-        .unwrap_or(original_query.len());
-    // The per-partition ORDER BY clause stops before any top-level OFFSET/LIMIT:
-    // the window is applied once, globally, by the client's `SkipTake`. Pushing
-    // it per partition would skip/limit locally and again on the client.
-    let order_by_end = order_idx.and_then(|oi| {
-        top_level
-            .iter()
-            .copied()
-            .find(|&i| i > oi && tokens[i].kind == TokenKind::Offset && is_clause_keyword(i))
-            .map(|i| tokens[i].span.start)
-    });
-    let order_by_text = order_idx.map(|i| {
-        let end = order_by_end.unwrap_or(original_query.len());
-        original_query[tokens[i].span.start..end].trim()
-    })?;
-
-    // FROM is emitted verbatim; the placeholder is ANDed into WHERE
-    // (creating one if absent) — the slot every rewritten query carries.
-    let where_bound = order_idx.unwrap_or(tokens.len());
-    let where_idx = top_level.iter().copied().find(|&i| {
-        i > from_idx
-            && i < where_bound
-            && tokens[i].kind == TokenKind::Where
-            && is_clause_keyword(i)
-    });
-    let from_end = where_idx
-        .map(|i| tokens[i].span.start)
-        .unwrap_or(clause_end);
-    let from_text = original_query[tokens[from_idx].span.start..from_end].trim();
-    let where_clause = match where_idx {
-        Some(i) => {
-            let predicate = original_query[tokens[i].span.end..clause_end].trim();
-            format!("WHERE ({predicate}) AND {ORDER_BY_FILTER_PLACEHOLDER}")
-        }
-        None => format!("WHERE {ORDER_BY_FILTER_PLACEHOLDER}"),
-    };
-
-    let order_by_items: Vec<String> = order_by_expressions
-        .iter()
-        .map(|expr| format!(r#"{{"item": {expr}}}"#))
-        .collect();
-
-    Some(format!(
-        r#"SELECT VALUE {{"_rid": {alias}._rid, "orderByItems": [{items}], "payload": {payload}}} {from_text} {where_clause} {order_by}"#,
-        items = order_by_items.join(", "),
-        payload = payload,
-        from_text = from_text,
-        where_clause = where_clause,
-        order_by = order_by_text,
-    ))
-}
-
-fn full_query_range() -> crate::driver::dataflow::query_plan::QueryRange {
-    crate::driver::dataflow::query_plan::QueryRange {
-        min: Epk::MIN.to_hex(),
-        max: Epk::MAX.to_hex(),
-        is_min_inclusive: true,
-        is_max_inclusive: false,
-    }
-}
-
-fn epk_range_to_query_range(
-    range: std::ops::Range<EffectivePartitionKey>,
-) -> crate::driver::dataflow::query_plan::QueryRange {
-    crate::driver::dataflow::query_plan::QueryRange {
-        min: range.start.to_hex(),
-        max: range.end.to_hex(),
-        is_min_inclusive: true,
-        is_max_inclusive: true,
-    }
-}
-
-fn model_partition_key_values(
-    values: &[crate::query::plan::PartitionKeyValue],
-) -> crate::error::Result<Vec<ModelPartitionKeyValue>> {
-    values
-        .iter()
-        .map(|value| match value {
-            crate::query::plan::PartitionKeyValue::String(s) => {
-                Ok(ModelPartitionKeyValue::from(s.clone()))
-            }
-            crate::query::plan::PartitionKeyValue::Number(n) => {
-                Ok(ModelPartitionKeyValue::from(*n))
-            }
-            crate::query::plan::PartitionKeyValue::Bool(b) => Ok(ModelPartitionKeyValue::from(*b)),
-            crate::query::plan::PartitionKeyValue::Null => Ok(ModelPartitionKeyValue::NULL),
-            crate::query::plan::PartitionKeyValue::Undefined => {
-                Ok(ModelPartitionKeyValue::UNDEFINED)
-            }
-            crate::query::plan::PartitionKeyValue::UnboundParameter(name) => {
-                Err(crate::error::CosmosError::builder()
-                    .with_status(crate::error::CosmosStatus::new(StatusCode::BadRequest))
-                    .with_message(format!(
-                        "query plan partition key filter references unbound parameter @{name}"
-                    ))
-                    .build())
-            }
-            crate::query::plan::PartitionKeyValue::InvalidParameter { name, reason } => {
-                Err(crate::error::CosmosError::builder()
-                    .with_status(crate::error::CosmosStatus::new(StatusCode::BadRequest))
-                    .with_message(format!(
-                        "query plan partition key filter parameter @{name} is invalid: {reason}"
-                    ))
-                    .build())
-            }
-        })
-        .collect()
-}
-
-fn query_ranges_from_pk_filter(
-    filter: &crate::query::plan::PartitionKeyFilter,
-    pk_definition: &PartitionKeyDefinition,
-) -> crate::error::Result<Vec<crate::driver::dataflow::query_plan::QueryRange>> {
-    match filter {
-        crate::query::plan::PartitionKeyFilter::Equality(values) => {
-            let values = model_partition_key_values(values)?;
-            let range = EffectivePartitionKey::compute_range(&values, pk_definition)?;
-            Ok(vec![epk_range_to_query_range(range)])
-        }
-        crate::query::plan::PartitionKeyFilter::InList(value_sets) => value_sets
-            .iter()
-            .map(|values| {
-                let values = model_partition_key_values(values)?;
-                EffectivePartitionKey::compute_range(&values, pk_definition)
-                    .map(epk_range_to_query_range)
-            })
-            .collect(),
-        crate::query::plan::PartitionKeyFilter::Contradictory => Ok(Vec::new()),
-        crate::query::plan::PartitionKeyFilter::Unconstrained
-        | crate::query::plan::PartitionKeyFilter::NotEvaluated => Ok(vec![full_query_range()]),
-    }
+    crate::query::local_plan_adapter::synthesize_order_by_rewritten_query(
+        original_query,
+        order_by_expressions,
+    )
 }
 
 fn handle_query_plan(
@@ -3726,7 +3472,7 @@ fn handle_query_plan(
         }
     };
 
-    let query_ranges = match query_ranges_from_pk_filter(
+    let query_ranges = match crate::query::local_plan_adapter::query_ranges_from_pk_filter(
         &local_plan.pk_filters,
         &container.metadata.partition_key,
     ) {
@@ -3809,11 +3555,20 @@ enum BatchOperation {
     },
 }
 
+/// Per-operation RU charge the emulator reports for a batch operation.
+///
+/// A stand-in: the emulator does not model RU accounting. The value is
+/// deliberately **fractional**, because a real account's charges are — a live
+/// two-item batch billed `6.2857142857142856` RU per operation. An integral
+/// stub would be the one input that makes text normalization rewrite an
+/// emulator-authored number (`1.0` into `1`), a difference the service can
+/// never produce and so not one worth reproducing.
+const BATCH_OPERATION_CHARGE: f64 = 1.24;
+
 fn batch_result(
     status_code: u16,
     resource_body: Option<serde_json::Value>,
     etag: Option<&str>,
-    request_charge: f64,
 ) -> serde_json::Value {
     let mut result = serde_json::Map::new();
     result.insert("statusCode".to_string(), serde_json::json!(status_code));
@@ -3825,7 +3580,7 @@ fn batch_result(
     }
     result.insert(
         "requestCharge".to_string(),
-        serde_json::json!(request_charge),
+        serde_json::json!(BATCH_OPERATION_CHARGE),
     );
     serde_json::Value::Object(result)
 }
@@ -3839,9 +3594,9 @@ fn failed_batch_results(
     (0..len)
         .map(|i| {
             if i == failure_index {
-                batch_result(failure_status, failure_body.clone(), None, 1.0)
+                batch_result(failure_status, failure_body.clone(), None)
             } else {
-                batch_result(424, None, None, 1.0)
+                batch_result(424, None, None)
             }
         })
         .collect()
@@ -3905,6 +3660,8 @@ async fn handle_batch(
     let write_lock = store.document_write_lock();
     #[cfg(feature = "preview_dtx")]
     let _write_guard = write_lock.lock().await;
+    let replication_barrier = store.replication_barrier();
+    let _replication_guard = replication_barrier.read().await;
 
     const MAX_BATCH_OPERATIONS: usize = 100;
     const MAX_BATCH_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
@@ -4054,7 +3811,6 @@ async fn handle_batch(
                         201,
                         parsed.content_response_on_write.then_some(body),
                         Some(&etag),
-                        1.0,
                     ));
                 }
                 BatchOperation::Upsert {
@@ -4117,7 +3873,6 @@ async fn handle_batch(
                         status,
                         parsed.content_response_on_write.then_some(body),
                         Some(&etag),
-                        1.0,
                     ));
                 }
                 BatchOperation::Replace {
@@ -4169,7 +3924,6 @@ async fn handle_batch(
                         200,
                         parsed.content_response_on_write.then_some(body),
                         Some(&etag),
-                        1.0,
                     ));
                 }
                 BatchOperation::Read {
@@ -4189,13 +3943,12 @@ async fn handle_batch(
                         .as_ref()
                         .is_some_and(|etag| etag == &existing.etag)
                     {
-                        results.push(batch_result(304, None, Some(&existing.etag), 1.0));
+                        results.push(batch_result(304, None, Some(&existing.etag)));
                     } else {
                         results.push(batch_result(
                             200,
                             Some(existing.body.clone()),
                             Some(&existing.etag),
-                            1.0,
                         ));
                     }
                 }
@@ -4222,7 +3975,7 @@ async fn handle_batch(
                         source_region: region_name.to_string(),
                     };
                     changes.push((tombstone, true));
-                    results.push(batch_result(204, None, Some(&existing.etag), 1.0));
+                    results.push(batch_result(204, None, Some(&existing.etag)));
                 }
             }
         }
@@ -4273,7 +4026,14 @@ async fn handle_batch(
                 StatusCode::Ok
             };
             let body = serde_json::Value::Array(results);
-            let mut builder = success_response(status, &body, charge, &token, start);
+            // Each result may embed a stored `resourceBody`, so the array is
+            // normalized the way the service renders a stored document. The
+            // envelope's own numbers ride along, but none of them can be
+            // rewritten: `statusCode` is already an integer, and both a real
+            // charge and [`BATCH_OPERATION_CHARGE`] are fractional. Text-only:
+            // batch has no binary format.
+            let mut builder =
+                success_response_with_format(status, &body, false, charge, &token, start);
             if let Some(lsn) = lsn {
                 builder = builder.with_lsn(lsn);
             }
@@ -4543,6 +4303,8 @@ async fn handle_create(
     let write_lock = store.document_write_lock();
     #[cfg(feature = "preview_dtx")]
     let _write_guard = write_lock.lock().await;
+    let replication_barrier = store.replication_barrier();
+    let _replication_guard = replication_barrier.read().await;
 
     handle_create_locked(store, region_name, parsed, request_body, start).await
 }
@@ -4839,7 +4601,18 @@ fn handle_read(
         // a token that the partition trivially satisfies and treat the
         // failure as transient. Echoing back what they asked for makes the
         // mismatch visible.
-        if store.config().consistency().is_session() {
+        let session_consistency_active = match parsed.read_consistency_strategy {
+            Some(crate::options::ReadConsistencyStrategy::Session) => true,
+            Some(crate::options::ReadConsistencyStrategy::Default) | None => {
+                store.config().consistency().is_session()
+            }
+            Some(
+                crate::options::ReadConsistencyStrategy::Eventual
+                | crate::options::ReadConsistencyStrategy::LatestCommitted
+                | crate::options::ReadConsistencyStrategy::GlobalStrong,
+            ) => false,
+        };
+        if session_consistency_active {
             if let Some(session_header) = &parsed.session_token {
                 let tokens = match super::session::parse_composite_session_token(session_header) {
                     Ok(tokens) => tokens,
@@ -5014,8 +4787,329 @@ async fn handle_replace(
     let write_lock = store.document_write_lock();
     #[cfg(feature = "preview_dtx")]
     let _write_guard = write_lock.lock().await;
+    let replication_barrier = store.replication_barrier();
+    let _replication_guard = replication_barrier.read().await;
 
     handle_replace_locked(store, region_name, parsed, request_body, start).await
+}
+
+async fn handle_patch(
+    store: &Arc<EmulatorStore>,
+    region_name: &str,
+    parsed: &ParsedRequest,
+    request_body: &[u8],
+    start: Instant,
+) -> AsyncRawResponse {
+    #[cfg(feature = "preview_dtx")]
+    let write_lock = store.document_write_lock();
+    #[cfg(feature = "preview_dtx")]
+    let _write_guard = write_lock.lock().await;
+    let replication_barrier = store.replication_barrier();
+    let _replication_guard = replication_barrier.read().await;
+
+    handle_patch_locked(store, region_name, parsed, request_body, start).await
+}
+
+/// Applies a server-side single-document PATCH atomically.
+async fn handle_patch_locked(
+    store: &Arc<EmulatorStore>,
+    region_name: &str,
+    parsed: &ParsedRequest,
+    request_body: &[u8],
+    start: Instant,
+) -> AsyncRawResponse {
+    let db_id = parsed.db_id.as_deref().unwrap_or("");
+    let coll_id = parsed.coll_id.as_deref().unwrap_or("");
+    let doc_id = parsed.doc_id.as_deref().unwrap_or("");
+
+    if let Some(response) = replication_back_pressure_response(store, region_name, start) {
+        return response;
+    }
+
+    let instructions: PatchInstructions = match serde_json::from_slice(request_body) {
+        Ok(instructions) => instructions,
+        Err(_) => {
+            return error_response(
+                StatusCode::BadRequest,
+                None,
+                "BadRequest",
+                "Invalid JSON patch body",
+                0.0,
+                "",
+                start,
+            )
+            .build()
+        }
+    };
+
+    if instructions.operations.is_empty() {
+        return error_response(
+            StatusCode::BadRequest,
+            None,
+            "BadRequest",
+            "The patch operation list cannot be empty.",
+            0.0,
+            "",
+            start,
+        )
+        .build();
+    }
+
+    if instructions.operations.len() > MAX_SERVER_SIDE_PATCH_OPERATIONS {
+        return error_response(
+            StatusCode::BadRequest,
+            None,
+            "BadRequest",
+            &format!(
+                "The number of patch operations cannot exceed {MAX_SERVER_SIDE_PATCH_OPERATIONS}."
+            ),
+            0.0,
+            "",
+            start,
+        )
+        .build();
+    }
+
+    let region = match store.region(region_name) {
+        Some(region) => region,
+        None => return not_found_region(start),
+    };
+
+    let result = region.with_container(db_id, coll_id, |state| {
+        let (_, epk) =
+            match resolve_partition_key(parsed, &serde_json::Value::Null, &state.metadata) {
+                Ok(partition_key) => partition_key,
+                Err(error) => return Err(bad_partition_key_response(error, start)),
+            };
+
+        let partition = match state.find_partition(&epk) {
+            Some(partition) => partition,
+            None => {
+                return Err(error_response(
+                    StatusCode::InternalServerError,
+                    None,
+                    "InternalError",
+                    "No partition found for EPK",
+                    1.0,
+                    "",
+                    start,
+                )
+                .build())
+            }
+        };
+
+        if let Some(response) = check_partition_lock(partition, start) {
+            return Err(response);
+        }
+
+        let region_id = store.config().region_id_for(region_name);
+        let token = session_token_for(
+            partition,
+            region_id,
+            incoming_session_for(parsed, partition.id).as_ref(),
+        );
+
+        let (new_document, charge) = {
+            let mut documents = partition.documents.write().unwrap();
+            let logical_partition = match documents.get_mut(&epk) {
+                Some(logical_partition) => logical_partition,
+                None => return Err(patch_not_found(doc_id, &token, start)),
+            };
+            let current = match logical_partition.get(doc_id).cloned() {
+                Some(current) => current,
+                None => return Err(patch_not_found(doc_id, &token, start)),
+            };
+            let charge = store.config().ru_model().compute_replace_or_delete_ru(
+                current.body_size_bytes,
+                instructions.operations.len(),
+            );
+
+            if parsed
+                .if_match
+                .as_ref()
+                .is_some_and(|if_match| if_match != "*" && if_match != &current.etag)
+            {
+                return Err(error_response(
+                    StatusCode::PreconditionFailed,
+                    None,
+                    "PreconditionFailed",
+                    "One of the specified pre-condition is not met.",
+                    1.0,
+                    &token,
+                    start,
+                )
+                .build());
+            }
+            if parsed
+                .if_none_match
+                .as_ref()
+                .is_some_and(|if_none_match| if_none_match == "*" || if_none_match == &current.etag)
+            {
+                return Err(error_response(
+                    StatusCode::PreconditionFailed,
+                    None,
+                    "PreconditionFailed",
+                    "One of the specified pre-condition is not met.",
+                    1.0,
+                    &token,
+                    start,
+                )
+                .build());
+            }
+
+            let mut patched_body = current.body.clone();
+            if let Err(error) = apply_patch_ops(&mut patched_body, &instructions.operations) {
+                return Err(error_response(
+                    StatusCode::BadRequest,
+                    None,
+                    "BadRequest",
+                    &error.to_string(),
+                    1.0,
+                    &token,
+                    start,
+                )
+                .build());
+            }
+
+            match patched_body.get("id").and_then(|value| value.as_str()) {
+                Some(body_id) if body_id == doc_id => {}
+                Some(_) => {
+                    return Err(error_response(
+                        StatusCode::BadRequest,
+                        None,
+                        "BadRequest",
+                        "Document id in request body must match the resource id in the request URI",
+                        1.0,
+                        &token,
+                        start,
+                    )
+                    .build());
+                }
+                None => {
+                    return Err(error_response(
+                        StatusCode::BadRequest,
+                        None,
+                        "BadRequest",
+                        "Missing 'id' field in document",
+                        1.0,
+                        &token,
+                        start,
+                    )
+                    .build());
+                }
+            }
+
+            let patched_components =
+                match extract_pk_from_body(&patched_body, state.metadata.partition_key.paths()) {
+                    Ok(components) => components,
+                    Err(error) => return Err(bad_partition_key_response(error, start)),
+                };
+            let patched_epk = compute_epk(
+                &patched_components,
+                state.metadata.partition_key.kind(),
+                state.metadata.partition_key.version(),
+            );
+            if patched_epk != epk {
+                return Err(error_response(
+                    StatusCode::BadRequest,
+                    None,
+                    "BadRequest",
+                    "The partition key value cannot be changed by a patch operation.",
+                    1.0,
+                    &token,
+                    start,
+                )
+                .build());
+            }
+
+            if let Some(response) = check_throttle(
+                partition,
+                charge,
+                store.config().throttling_enabled(),
+                start,
+            ) {
+                return Err(response);
+            }
+
+            let lsn = partition.advance_lsn();
+            partition.advance_local_lsn();
+            let timestamp = current_timestamp();
+            let etag = new_etag();
+            inject_system_properties(
+                &current.rid,
+                &current.self_link,
+                &etag,
+                timestamp,
+                &mut patched_body,
+            );
+            let body_size_bytes = serde_json::to_vec(&patched_body).map_or(0, |bytes| bytes.len());
+            let new_document = StoredDocument {
+                body: patched_body,
+                id: doc_id.to_string(),
+                rid: current.rid,
+                etag,
+                ts: timestamp,
+                self_link: current.self_link,
+                lsn,
+                epk: epk.clone(),
+                body_size_bytes,
+                source_region: region_name.to_string(),
+            };
+            logical_partition.insert(doc_id.to_string(), new_document.clone());
+            (new_document, charge)
+        };
+
+        let token = session_token_for(
+            partition,
+            region_id,
+            incoming_session_for(parsed, partition.id).as_ref(),
+        );
+        let headers = Some(PointResponseHeaders::from_partition(
+            partition,
+            store.next_transport_request_id(),
+        ));
+        Ok((new_document, token, charge, headers))
+    });
+
+    match result {
+        Some(Ok((document, token, charge, headers))) => {
+            store.replicate(region_name, db_id, coll_id, &document, false);
+            let builder = if parsed.content_response_on_write {
+                success_response_with_format(
+                    StatusCode::Ok,
+                    &document.body,
+                    parsed.binary_response,
+                    charge,
+                    &token,
+                    start,
+                )
+                .with_etag(&document.etag)
+                .with_lsn(document.lsn)
+            } else {
+                ResponseBuilder::new(StatusCode::Ok, start)
+                    .with_request_charge(charge)
+                    .with_session_token(&token)
+                    .with_etag(&document.etag)
+                    .with_lsn(document.lsn)
+            };
+            decorate_point_response(builder, headers, Some(document.lsn)).build()
+        }
+        Some(Err(response)) => response,
+        None => container_not_found(db_id, coll_id, start),
+    }
+}
+
+fn patch_not_found(doc_id: &str, token: &str, start: Instant) -> AsyncRawResponse {
+    error_response(
+        StatusCode::NotFound,
+        None,
+        "NotFound",
+        &format!("Entity with the specified id does not exist in the system. ResourceId: {doc_id}"),
+        1.0,
+        token,
+        start,
+    )
+    .build()
 }
 
 async fn handle_replace_locked(
@@ -5359,6 +5453,8 @@ async fn handle_upsert(
     let write_lock = store.document_write_lock();
     #[cfg(feature = "preview_dtx")]
     let _write_guard = write_lock.lock().await;
+    let replication_barrier = store.replication_barrier();
+    let _replication_guard = replication_barrier.read().await;
 
     handle_upsert_locked(store, region_name, parsed, request_body, start).await
 }
@@ -5591,6 +5687,8 @@ async fn handle_delete(
     let write_lock = store.document_write_lock();
     #[cfg(feature = "preview_dtx")]
     let _write_guard = write_lock.lock().await;
+    let replication_barrier = store.replication_barrier();
+    let _replication_guard = replication_barrier.read().await;
 
     handle_delete_locked(store, region_name, parsed, start).await
 }
@@ -6027,12 +6125,13 @@ mod tests {
     }
 
     #[test]
-    fn order_by_rewrite_rejects_unsupported_select_list() {
-        assert!(synthesize_order_by_rewritten_query(
+    fn order_by_rewrite_builds_select_list_payload() {
+        let rewritten = synthesize_order_by_rewritten_query(
             "SELECT c.id FROM c ORDER BY c.rank",
             &["c.rank".to_owned()],
         )
-        .is_none());
+        .unwrap();
+        assert!(rewritten.contains(r#""payload": {"id": c.id}"#));
     }
 
     #[test]
