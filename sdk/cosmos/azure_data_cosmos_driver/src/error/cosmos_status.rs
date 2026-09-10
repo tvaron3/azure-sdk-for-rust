@@ -503,7 +503,7 @@ impl SubStatusCode {
             20123 => Some("ClientDistinctValueTooDeeplyNested"),
             20124 => Some("ClientDistinctContinuationUnsupported"),
             20125 => Some("ClientNonStreamingOrderByContinuationUnsupported"),
-            20126 => Some("ClientNonStreamingOrderByRequiresFiniteWindow"),
+            20126 => Some("ClientBufferedQueryRequiresFiniteWindow"),
             20127 => Some("ClientNonStreamingOrderByWindowTooLarge"),
             20150 => Some("ClientDuplicateFaultInjectionRuleId"),
             20151 => Some("ClientThroughputControlGroupRegistrationFailed"),
@@ -1406,10 +1406,13 @@ impl SubStatusCode {
     pub const CLIENT_NON_STREAMING_ORDER_BY_CONTINUATION_UNSUPPORTED: SubStatusCode =
         SubStatusCode(20125);
 
-    /// A non-streaming `ORDER BY` query did not contain a finite `TOP` or
-    /// `OFFSET`/`LIMIT` window (20126).
+    /// A buffered query requires a finite global TOP/LIMIT or explicit opt-out
+    /// (20126), including non-streaming ORDER BY and unordered DISTINCT.
+    pub const CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW: SubStatusCode = SubStatusCode(20126);
+
+    /// Compatibility alias for [`Self::CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW`].
     pub const CLIENT_NON_STREAMING_ORDER_BY_REQUIRES_FINITE_WINDOW: SubStatusCode =
-        SubStatusCode(20126);
+        Self::CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW;
 
     /// A non-streaming `ORDER BY` query's candidate window cannot be represented
     /// by the current process (20127).
@@ -2394,11 +2397,16 @@ impl CosmosStatus {
         sub_status: Some(SubStatusCode::CLIENT_NON_STREAMING_ORDER_BY_CONTINUATION_UNSUPPORTED),
     };
 
-    /// 400 / 20126 — non-streaming `ORDER BY` requires a finite result window.
-    pub const CLIENT_NON_STREAMING_ORDER_BY_REQUIRES_FINITE_WINDOW: CosmosStatus = CosmosStatus {
+    /// 400 / 20126 — a buffered query requires a finite global TOP/LIMIT or
+    /// explicit opt-out, including non-streaming ORDER BY and unordered DISTINCT.
+    pub const CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW: CosmosStatus = CosmosStatus {
         status_code: StatusCode::BadRequest,
-        sub_status: Some(SubStatusCode::CLIENT_NON_STREAMING_ORDER_BY_REQUIRES_FINITE_WINDOW),
+        sub_status: Some(SubStatusCode::CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW),
     };
+
+    /// Compatibility alias for [`Self::CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW`].
+    pub const CLIENT_NON_STREAMING_ORDER_BY_REQUIRES_FINITE_WINDOW: CosmosStatus =
+        Self::CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW;
 
     /// 400 / 20127 — the non-streaming `ORDER BY` candidate window cannot be
     /// represented by the current process.
@@ -2764,6 +2772,27 @@ mod tests {
         assert_eq!(
             CosmosStatus::CLIENT_MIXED_NAME_RID_ADDRESSING.name(),
             Some("ClientMixedNameRidAddressing")
+        );
+    }
+
+    #[test]
+    fn buffered_query_status_preserves_existing_code() {
+        let status = CosmosStatus::new(StatusCode::BadRequest).with_sub_status(20126);
+        assert_eq!(
+            status,
+            CosmosStatus::CLIENT_BUFFERED_QUERY_REQUIRES_FINITE_WINDOW
+        );
+        assert_eq!(
+            status,
+            CosmosStatus::CLIENT_NON_STREAMING_ORDER_BY_REQUIRES_FINITE_WINDOW
+        );
+        assert_eq!(
+            status.sub_status(),
+            Some(SubStatusCode::CLIENT_NON_STREAMING_ORDER_BY_REQUIRES_FINITE_WINDOW)
+        );
+        assert_eq!(
+            status.name(),
+            Some("ClientBufferedQueryRequiresFiniteWindow")
         );
     }
 

@@ -4290,6 +4290,14 @@ impl CosmosDriver {
             ResolvedQueryPlan::Plan(plan) => *plan,
         };
 
+        planner::validate_buffered_query(
+            &query_plan,
+            self.operation_options_view(options)
+                .allow_unbounded_queries()
+                .copied()
+                .unwrap_or(false),
+        )?;
+
         // Build the fan-out pipeline using the query plan.
         let container_ref = container.clone();
         let mut topology = CachedTopologyProvider::new(
