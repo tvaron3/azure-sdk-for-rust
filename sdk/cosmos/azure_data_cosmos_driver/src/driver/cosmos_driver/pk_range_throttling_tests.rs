@@ -291,8 +291,8 @@ async fn setup_with_metadata_timeout(
     let properties = ContainerProperties {
         id: "items".into(),
         partition_key: serde_json::from_str(r#"{"paths":["/pk"],"version":2}"#).unwrap(),
-        system_properties: Default::default(),
         vector_embedding_policy: None,
+        system_properties: Default::default(),
     };
     let container =
         ContainerReference::new(account, "db", "db-rid", "items", "items-rid", &properties);
